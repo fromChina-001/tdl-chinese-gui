@@ -36,7 +36,9 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:AppVersion = '1.1.0'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
+$script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
 $script:SettingsPath = Join-Path $script:AppDir 'gui-settings.json'
 $script:QueuePath = Join-Path $script:AppDir 'gui-queue.json'
@@ -58,8 +60,12 @@ $script:AccountName = ''
 $script:AccountUserId = ''
 $script:AccountLastRefresh = ''
 $script:StartAfterAccountRefresh = $false
+$script:QueueHadWork = $false
 $script:LastLogText = ''
 $script:MainForm = $null
+$script:QueueSummaryLabel = $null
+$script:NotifyIcon = $null
+$script:NotifyTimer = $null
 
 function Ensure-Directory {
     param([string]$Path)
@@ -80,8 +86,10 @@ function Get-DefaultSettings {
         Limit            = 2
         RetryCount       = 2
         GroupMedia       = $true
-        SkipSame         = $true
-        AutoStart        = $true
+        SkipSame               = $true
+        AutoStart              = $true
+        CompletionNotification = $true
+        WelcomeShown           = $false
     }
 }
 
@@ -263,6 +271,16 @@ function Complete-CapturedRun {
     try { $Run.StderrStream.Dispose() } catch {}
 }
 
+function Remove-CapturedRunFiles {
+    param($Run)
+    if ($null -eq $Run) { return }
+    foreach ($file in @($Run.StdoutPath, $Run.StderrPath)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$file) -and (Test-Path -LiteralPath $file)) {
+            try { Remove-Item -LiteralPath $file -Force } catch {}
+        }
+    }
+}
+
 function Stop-CapturedRun {
     param($Run)
     if ($null -eq $Run) { return }
@@ -311,10 +329,139 @@ function Get-DownloadArguments {
     return $arguments.ToArray()
 }
 
+function Normalize-TelegramMessageUrl {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return '' }
+
+    $candidate = $Url.Trim()
+    $candidate = $candidate.TrimEnd([char[]]@('.', ',', '，', '。', ';', '；', '!', '！', ')', '）', ']', '】', '}', '》'))
+    if ($candidate -notmatch '^(?i)https?://') {
+        $candidate = "https://$candidate"
+    }
+    return $candidate
+}
+
 function Test-TelegramMessageUrl {
     param([string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
-    return ($Url.Trim() -match '^(?i)(https?://)?(t\.me|telegram\.me)/.+/\d+(?:\?.*)?$')
+    $candidate = Normalize-TelegramMessageUrl $Url
+    return ($candidate -match '^(?i)https?://(t\.me|telegram\.me)/[^\s]+/\d+(?:\?[^\s]*)?$')
+}
+
+function Get-TelegramMessageUrls {
+    param([string]$Text)
+    $urls = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $urls.ToArray() }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $pattern = '(?i)(?:https?://)?(?:t\.me|telegram\.me)/[^\s<>"''，。；！？、]+/\d+(?:\?[^\s<>"''，。；！？、]*)?'
+    foreach ($match in [regex]::Matches($Text, $pattern)) {
+        $url = Normalize-TelegramMessageUrl $match.Value
+        if ((Test-TelegramMessageUrl $url) -and $seen.Add($url)) {
+            $urls.Add($url)
+        }
+    }
+    return $urls.ToArray()
+}
+
+function Get-FriendlyTdlError {
+    param([string]$Text, [int]$ExitCode)
+
+    $clean = Remove-AnsiCodes $Text
+    if ($clean -match '(?i)(timeout|deadline exceeded|i/o timeout|connection refused|network is unreachable|no such host)') {
+        return '网络连接失败，请检查网络或在“设置”中配置代理。'
+    }
+    if ($clean -match '(?i)(flood.?wait|too many requests|rate limit)') {
+        return 'Telegram 请求过于频繁，请稍等一段时间后重试。'
+    }
+    if ($clean -match '(?i)(auth.?key|session.*revoked|unauthorized|not authorized)') {
+        return 'Telegram 登录已失效，请点击右上角重新登录。'
+    }
+    if ($clean -match '(?i)(message.?id.?invalid|message not found|channel private|chat.*forbidden|access denied)') {
+        return '消息不存在或当前账号无权访问，请检查链接和账号权限。'
+    }
+    if ($clean -match '(?i)(no space left|disk full|not enough space)') {
+        return '磁盘空间不足，请清理磁盘或更换下载目录。'
+    }
+    if ($clean -match '(?i)(permission denied|access is denied)') {
+        return '无法写入下载目录，请在“设置”中更换保存位置。'
+    }
+
+    $usefulLines = @(($clean -split [char]10) | ForEach-Object { $_.Trim() } | Where-Object {
+        -not [string]::IsNullOrWhiteSpace($_) -and
+        $_ -notmatch '^(CPU|Memory|Goroutines|Progress)'
+    })
+    if ($usefulLines.Count -gt 0) {
+        $message = [string]($usefulLines | Select-Object -Last 1)
+        $message = [regex]::Replace($message, '(?i)https?://(?:t\.me|telegram\.me)/[^\s]+', '[Telegram 消息链接]')
+        if ($message.Length -gt 180) { $message = $message.Substring(0, 180) + '…' }
+        return $message
+    }
+    return "下载失败，退出代码：$ExitCode"
+}
+
+function Get-QueueItemNumber {
+    param([System.Windows.Forms.ListViewItem]$Row)
+    if ($null -eq $Row -or $null -eq $script:QueueList) { return 0 }
+    return $script:QueueList.Items.IndexOf($Row) + 1
+}
+
+function Update-QueueSummary {
+    if ($null -eq $script:QueueList -or $null -eq $script:QueueSummaryLabel) { return }
+    $counts = @{
+        Waiting = 0
+        Active  = 0
+        Failed  = 0
+        Done    = 0
+    }
+    foreach ($row in $script:QueueList.Items) {
+        switch ([string]$row.Tag.Status) {
+            '等待中' { $counts.Waiting++ }
+            '下载中' { $counts.Active++ }
+            '失败'   { $counts.Failed++ }
+            '已停止' { $counts.Failed++ }
+            '已完成' { $counts.Done++ }
+        }
+    }
+    $script:QueueSummaryLabel.Text = "共 $($script:QueueList.Items.Count) 条 · 等待 $($counts.Waiting) · 下载中 $($counts.Active) · 失败 $($counts.Failed) · 完成 $($counts.Done)"
+}
+
+function Show-QueueCompletionNotification {
+    if (-not [bool]$script:Settings.CompletionNotification) { return }
+    try {
+        if ($null -eq $script:NotifyIcon) {
+            $script:NotifyIcon = New-Object Windows.Forms.NotifyIcon
+            $script:NotifyIcon.Icon = [Drawing.SystemIcons]::Information
+            $script:NotifyIcon.Text = 'tdl Chinese GUI'
+        }
+        $failed = 0
+        foreach ($row in $script:QueueList.Items) {
+            if ($row.Tag.Status -in @('失败', '已停止')) { $failed++ }
+        }
+        $message = if ($failed -gt 0) {
+            "下载队列已处理完毕，其中 $failed 项需要重试。"
+        }
+        else {
+            '下载队列已全部完成。'
+        }
+        $script:NotifyIcon.Visible = $true
+        $script:NotifyIcon.ShowBalloonTip(5000, 'Telegram 下载器', $message, [Windows.Forms.ToolTipIcon]::Info)
+        [System.Media.SystemSounds]::Asterisk.Play()
+
+        if ($null -eq $script:NotifyTimer) {
+            $script:NotifyTimer = New-Object Windows.Forms.Timer
+            $script:NotifyTimer.Interval = 6000
+            $script:NotifyTimer.Add_Tick({
+                $script:NotifyTimer.Stop()
+                if ($null -ne $script:NotifyIcon) { $script:NotifyIcon.Visible = $false }
+            })
+        }
+        $script:NotifyTimer.Stop()
+        $script:NotifyTimer.Start()
+    }
+    catch {
+        # Notifications are optional and must never affect downloading.
+    }
 }
 
 function Get-QueueData {
@@ -355,11 +502,13 @@ function Update-QueueRow {
         default  { $Row.ForeColor = [Drawing.Color]::FromArgb(45, 45, 48) }
     }
     Save-Queue
+    Update-QueueSummary
 }
 
 function Add-QueueUrl {
     param([string]$Url, [string]$InitialStatus = '等待中', [int]$Attempts = 0)
-    $normalized = $Url.Trim()
+    $normalized = Normalize-TelegramMessageUrl $Url
+    if (-not (Test-TelegramMessageUrl $normalized)) { return $false }
     foreach ($existing in $script:QueueList.Items) {
         if ($existing.Tag.Url -eq $normalized -and $existing.Tag.Status -notin @('已完成', '失败', '已停止')) {
             return $false
@@ -393,8 +542,143 @@ function Load-Queue {
     catch {
         # Ignore an obsolete queue file.
     }
+    Update-QueueSummary
 }
 
+function Remove-SelectedQueueItems {
+    $selected = @($script:QueueList.SelectedItems)
+    if ($selected.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '请先在队列中选择要移除的项目。', '移除队列项', 'OK', 'Information')
+        return
+    }
+
+    $removed = 0
+    $activeSkipped = 0
+    foreach ($row in $selected) {
+        if ($row.Tag.Status -eq '下载中') {
+            $activeSkipped++
+            continue
+        }
+        $script:QueueList.Items.Remove($row)
+        $removed++
+    }
+    Save-Queue
+    Update-QueueSummary
+    if ($removed -gt 0) { Append-Log "已从队列移除 $removed 项。" }
+    if ($activeSkipped -gt 0) {
+        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '正在下载的项目不能直接移除，请先停止当前任务。', '移除队列项', 'OK', 'Information')
+    }
+}
+
+function Open-SelectedTelegramMessage {
+    if ($script:QueueList.SelectedItems.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '请先选择一个队列项目。', '打开原消息', 'OK', 'Information')
+        return
+    }
+    try {
+        $url = [string]$script:QueueList.SelectedItems[0].Tag.Url
+        $startInfo = New-Object Diagnostics.ProcessStartInfo
+        $startInfo.FileName = $url
+        $startInfo.UseShellExecute = $true
+        [void][Diagnostics.Process]::Start($startInfo)
+    }
+    catch {
+        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '无法打开该消息链接。', '打开原消息', 'OK', 'Error')
+    }
+}
+
+function Retry-SelectedQueueItems {
+    if ($script:QueueList.SelectedItems.Count -eq 0) {
+        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '请先在队列中选择需要重试的项目。', '重试', 'OK', 'Information')
+        return
+    }
+    $changed = 0
+    foreach ($row in $script:QueueList.SelectedItems) {
+        if ($row.Tag.Status -in @('失败', '已停止')) {
+            $row.Tag.Attempts = 0
+            Update-QueueRow $row '等待中' ''
+            $changed++
+        }
+    }
+    if ($changed -gt 0) {
+        $script:DownloadPaused = $false
+        Start-NextDownload
+    }
+}
+
+function Test-TdlReady {
+    if (Test-Path -LiteralPath $script:TdlPath) { return $true }
+
+    $message = "未找到核心程序 tdl.exe。"
+    if (Test-Path -LiteralPath $script:InstallerPath) {
+        $message += [Environment]::NewLine + [Environment]::NewLine + '是否现在运行一键安装器？安装完成后会自动重新打开本程序。'
+        $answer = [Windows.Forms.MessageBox]::Show(
+            $script:MainForm,
+            $message,
+            '需要安装 tdl',
+            [Windows.Forms.MessageBoxButtons]::YesNo,
+            [Windows.Forms.MessageBoxIcon]::Information
+        )
+        if ($answer -eq [Windows.Forms.DialogResult]::Yes) {
+            try {
+                $startInfo = New-Object Diagnostics.ProcessStartInfo
+                $startInfo.FileName = $script:InstallerPath
+                $startInfo.WorkingDirectory = $script:AppDir
+                $startInfo.UseShellExecute = $true
+                [void][Diagnostics.Process]::Start($startInfo)
+                $script:MainForm.Close()
+            }
+            catch {
+                [void][Windows.Forms.MessageBox]::Show($script:MainForm, "无法启动安装器：$($_.Exception.Message)", '安装失败', 'OK', 'Error')
+            }
+        }
+    }
+    else {
+        [void][Windows.Forms.MessageBox]::Show(
+            $script:MainForm,
+            $message + [Environment]::NewLine + [Environment]::NewLine + '请重新下载完整安装包。',
+            '缺少核心程序',
+            'OK',
+            'Error'
+        )
+    }
+    return $false
+}
+
+function Show-FirstRunWelcome {
+    if ([bool]$script:Settings.WelcomeShown) { return }
+
+    $script:Settings.WelcomeShown = $true
+    Save-Settings
+    $baseMessage = '欢迎使用 tdl 中文图形界面！' +
+        [Environment]::NewLine + [Environment]::NewLine +
+        '使用只需三步：' + [Environment]::NewLine +
+        '1. 登录 Telegram 账号。' + [Environment]::NewLine +
+        '2. 粘贴消息链接或包含链接的文字。' + [Environment]::NewLine +
+        '3. 加入队列，等待下载完成。'
+
+    if (Test-Path -LiteralPath $script:SessionPath) {
+        [void][Windows.Forms.MessageBox]::Show(
+            $script:MainForm,
+            $baseMessage + [Environment]::NewLine + [Environment]::NewLine + '已检测到登录数据，可以直接开始使用。',
+            '首次使用向导',
+            'OK',
+            'Information'
+        )
+        return
+    }
+
+    $answer = [Windows.Forms.MessageBox]::Show(
+        $script:MainForm,
+        $baseMessage + [Environment]::NewLine + [Environment]::NewLine + '是否现在登录 Telegram？',
+        '首次使用向导',
+        [Windows.Forms.MessageBoxButtons]::YesNo,
+        [Windows.Forms.MessageBoxIcon]::Information
+    )
+    if ($answer -eq [Windows.Forms.DialogResult]::Yes) {
+        Show-LoginDialog
+    }
+}
 function Append-Log {
     param([string]$Text)
     if ([string]::IsNullOrWhiteSpace($Text)) { return }
@@ -626,9 +910,13 @@ function Start-NextDownload {
     if ($null -eq $nextRow) {
         $script:ProgressBar.Style = 'Blocks'
         $script:ProgressBar.Value = 0
-        $script:StatusLabel.Text = '队列已处理完毕'
+        $script:StatusLabel.Text = if ($script:QueueList.Items.Count -eq 0) { '队列为空' } else { '队列已处理完毕' }
         $script:StartButton.Enabled = $true
         $script:StopButton.Enabled = $false
+        if ($script:QueueHadWork) {
+            Show-QueueCompletionNotification
+            $script:QueueHadWork = $false
+        }
         return
     }
 
@@ -638,22 +926,25 @@ function Start-NextDownload {
         $script:CurrentQueueItem = $nextRow
         Update-QueueRow $nextRow '下载中' "第 $($nextRow.Tag.Attempts) 次尝试"
         $script:ActiveRun = Start-HiddenProcessCapture (Get-DownloadArguments $nextRow.Tag.Url) 'download'
+        $script:QueueHadWork = $true
         $script:LastLogText = ''
         $script:ProgressBar.Style = 'Marquee'
         $script:ProgressBar.MarqueeAnimationSpeed = 25
-        $script:StatusLabel.Text = '正在下载，请保持代理连接'
+        $script:StatusLabel.Text = '正在下载，请保持网络连接'
         $script:StartButton.Enabled = $false
         $script:StopButton.Enabled = $true
-        Append-Log "开始下载：$($nextRow.Tag.Url)"
+        Append-Log "开始下载队列第 $(Get-QueueItemNumber $nextRow) 项。"
     }
     catch {
-        Update-QueueRow $nextRow '失败' $_.Exception.Message
-        Append-Log "启动失败：$($_.Exception.Message)"
+        $message = Get-FriendlyTdlError $_.Exception.Message -1
+        Update-QueueRow $nextRow '失败' $message
+        Append-Log "启动失败：$message"
         $script:ActiveRun = $null
         $script:CurrentQueueItem = $null
+        $script:StartButton.Enabled = $true
+        $script:StopButton.Enabled = $false
     }
 }
-
 function Finish-CurrentDownload {
     $run = $script:ActiveRun
     $row = $script:CurrentQueueItem
@@ -663,6 +954,7 @@ function Finish-CurrentDownload {
     try { $exitCode = $run.Process.ExitCode } catch {}
     Complete-CapturedRun $run
     $finalText = Remove-AnsiCodes (Get-RunText $run)
+    $friendlyError = Get-FriendlyTdlError $finalText $exitCode
 
     if ($run.StopRequested) {
         Update-QueueRow $row '已停止' '用户停止了任务'
@@ -673,20 +965,17 @@ function Finish-CurrentDownload {
         Append-Log '下载完成。'
     }
     elseif ([int]$row.Tag.Attempts -le [int]$script:Settings.RetryCount) {
-        Update-QueueRow $row '等待中' "失败，准备自动重试（$($row.Tag.Attempts)/$($script:Settings.RetryCount)）"
-        Append-Log "下载失败，稍后自动重试。退出代码：$exitCode"
+        $remaining = ([int]$script:Settings.RetryCount + 1) - [int]$row.Tag.Attempts
+        Update-QueueRow $row '等待中' "下载失败，准备自动重试（剩余 $remaining 次）"
+        Append-Log "下载失败：$friendlyError 将自动重试。"
     }
     else {
-        $message = "下载失败，退出代码：$exitCode"
-        $usefulLines = @(($finalText -split "`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        if ($usefulLines.Count -gt 0) {
-            $message = ($usefulLines | Select-Object -Last 1).Trim()
-        }
-        Update-QueueRow $row '失败' $message
-        Append-Log "下载失败：$message"
+        Update-QueueRow $row '失败' $friendlyError
+        Append-Log "下载失败：$friendlyError"
     }
 
     try { $run.Process.Dispose() } catch {}
+    Remove-CapturedRunFiles $run
     $script:ActiveRun = $null
     $script:CurrentQueueItem = $null
     $script:ProgressBar.Style = 'Blocks'
@@ -697,7 +986,6 @@ function Finish-CurrentDownload {
         Start-NextDownload
     }
 }
-
 function Show-SettingsDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '下载设置'
@@ -741,7 +1029,7 @@ function Show-SettingsDialog {
     $form.Controls.Add($proxyBox)
 
     $proxyHint = New-Object Windows.Forms.Label
-    $proxyHint.Text = '当前电脑建议保持：http://127.0.0.1:7890'
+    $proxyHint.Text = '示例：http://127.0.0.1:7890（请按代理软件填写）'
     $proxyHint.Location = New-Object Drawing.Point(125, 130)
     $proxyHint.AutoSize = $true
     $proxyHint.ForeColor = [Drawing.Color]::DimGray
@@ -807,6 +1095,13 @@ function Show-SettingsDialog {
     $autoCheck.Checked = [bool]$script:Settings.AutoStart
     $form.Controls.Add($autoCheck)
 
+    $notifyCheck = New-Object Windows.Forms.CheckBox
+    $notifyCheck.Text = '队列完成后显示系统通知'
+    $notifyCheck.Location = New-Object Drawing.Point(320, 301)
+    $notifyCheck.AutoSize = $true
+    $notifyCheck.Checked = [bool]$script:Settings.CompletionNotification
+    $form.Controls.Add($notifyCheck)
+
     $saveButton = New-Object Windows.Forms.Button
     $saveButton.Text = '保存'
     $saveButton.Location = New-Object Drawing.Point(400, 360)
@@ -852,6 +1147,7 @@ function Show-SettingsDialog {
         $script:Settings.GroupMedia = $groupCheck.Checked
         $script:Settings.SkipSame = $skipCheck.Checked
         $script:Settings.AutoStart = $autoCheck.Checked
+        $script:Settings.CompletionNotification = $notifyCheck.Checked
         Save-Settings
         $script:DownloadPathLabel.Text = [string]$script:Settings.DownloadDirectory
         Append-Log '设置已保存。'
@@ -1002,6 +1298,7 @@ function Show-LoginDialog {
                 if ($details.Count -gt 0) { $qrBox.Text = $details -join "`r`n" }
             }
             try { $script:LoginRun.Process.Dispose() } catch {}
+            Remove-CapturedRunFiles $script:LoginRun
             $script:LoginRun = $null
             if ($exitCode -eq 0) { Start-AccountRefresh -Quiet }
         }
@@ -1014,6 +1311,7 @@ function Show-LoginDialog {
             Stop-CapturedRun $script:LoginRun
             Complete-CapturedRun $script:LoginRun
             try { $script:LoginRun.Process.Dispose() } catch {}
+            Remove-CapturedRunFiles $script:LoginRun
             $script:LoginRun = $null
         }
     })
@@ -1036,6 +1334,7 @@ if ($SelfTest) {
     Complete-CapturedRun $testRun
     $testOutput = Remove-AnsiCodes (Get-RunText $testRun)
     $testRun.Process.Dispose()
+    Remove-CapturedRunFiles $testRun
     if ($testExit -ne 0 -or $testOutput -notmatch 'Version') { throw "SELFTEST: tdl version failed ($testExit)" }
     $commonArgumentTest = Get-CommonArguments
     if ($commonArgumentTest -isnot [System.Collections.Generic.List[string]]) {
@@ -1044,6 +1343,10 @@ if ($SelfTest) {
     $downloadArgumentTest = Get-DownloadArguments 'https://t.me/c/1000000000/1'
     if ($downloadArgumentTest -notcontains 'dl' -or $downloadArgumentTest -notcontains 'https://t.me/c/1000000000/1') {
         throw 'SELFTEST: download arguments are incomplete'
+    }
+    $linkExtractionTest = @(Get-TelegramMessageUrls '请下载 t.me/demo_channel/123，另一个是 https://t.me/c/1000000000/456?single。')
+    if ($linkExtractionTest.Count -ne 2 -or $linkExtractionTest[0] -ne 'https://t.me/demo_channel/123') {
+        throw 'SELFTEST: Telegram link extraction failed'
     }
     Write-Output 'SELFTEST_OK'
     Write-Output ($testOutput.Trim())
@@ -1055,7 +1358,7 @@ $script:MainForm = New-Object Windows.Forms.Form
 $script:MainForm.Text = 'Telegram 文件下载器（中文版）'
 $script:MainForm.StartPosition = 'CenterScreen'
 $script:MainForm.ClientSize = New-Object Drawing.Size(1000, 735)
-$script:MainForm.MinimumSize = New-Object Drawing.Size(900, 680)
+$script:MainForm.MinimumSize = New-Object Drawing.Size(1016, 774)
 $script:MainForm.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
 $script:MainForm.BackColor = [Drawing.Color]::FromArgb(247, 248, 250)
 
@@ -1076,7 +1379,7 @@ $titleLabel.AutoSize = $true
 $header.Controls.Add($titleLabel)
 
 $subtitleLabel = New-Object Windows.Forms.Label
-$subtitleLabel.Text = '中文窗口 · 多链接队列 · 自动重试 · 无命令框'
+$subtitleLabel.Text = "v$script:AppVersion · 中文窗口 · 多链接队列 · 自动重试 · 无命令框"
 $subtitleLabel.ForeColor = [Drawing.Color]::FromArgb(220, 235, 250)
 $subtitleLabel.Location = New-Object Drawing.Point(27, 47)
 $subtitleLabel.AutoSize = $true
@@ -1156,7 +1459,7 @@ $script:DownloadPathLabel.ForeColor = [Drawing.Color]::DimGray
 $loginPanel.Controls.Add($script:DownloadPathLabel)
 
 $privacyLabel = New-Object Windows.Forms.Label
-$privacyLabel.Text = 'tdl 不读取手机号 / @用户名'
+$privacyLabel.Text = '界面不显示手机号 / @用户名'
 $privacyLabel.Location = New-Object Drawing.Point(725, 42)
 $privacyLabel.Size = New-Object Drawing.Size(220, 22)
 $privacyLabel.Anchor = 'Top,Right'
@@ -1167,7 +1470,7 @@ $loginPanel.Controls.Add($privacyLabel)
 Update-LoginIndicator
 
 $linkGroup = New-Object Windows.Forms.GroupBox
-$linkGroup.Text = '粘贴 Telegram 消息链接（每行一个）'
+$linkGroup.Text = '粘贴链接或聊天文字（自动识别 Telegram 消息链接）'
 $linkGroup.Location = New-Object Drawing.Point(20, 91)
 $linkGroup.Size = New-Object Drawing.Size(960, 132)
 $linkGroup.Anchor = 'Top,Left,Right'
@@ -1206,6 +1509,15 @@ $queueLabel.Location = New-Object Drawing.Point(20, 236)
 $queueLabel.AutoSize = $true
 $content.Controls.Add($queueLabel)
 
+$script:QueueSummaryLabel = New-Object Windows.Forms.Label
+$script:QueueSummaryLabel.Text = '共 0 条 · 等待 0 · 下载中 0 · 失败 0 · 完成 0'
+$script:QueueSummaryLabel.Location = New-Object Drawing.Point(120, 235)
+$script:QueueSummaryLabel.Size = New-Object Drawing.Size(860, 24)
+$script:QueueSummaryLabel.Anchor = 'Top,Left,Right'
+$script:QueueSummaryLabel.TextAlign = 'MiddleRight'
+$script:QueueSummaryLabel.ForeColor = [Drawing.Color]::DimGray
+$content.Controls.Add($script:QueueSummaryLabel)
+
 $script:QueueList = New-Object Windows.Forms.ListView
 $script:QueueList.Location = New-Object Drawing.Point(20, 262)
 $script:QueueList.Size = New-Object Drawing.Size(960, 152)
@@ -1218,6 +1530,16 @@ $script:QueueList.HideSelection = $false
 [void]$script:QueueList.Columns.Add('Telegram 消息链接', 600)
 [void]$script:QueueList.Columns.Add('结果', 240)
 $content.Controls.Add($script:QueueList)
+
+$queueMenu = New-Object Windows.Forms.ContextMenuStrip
+$openMessageMenu = New-Object Windows.Forms.ToolStripMenuItem('打开 Telegram 原消息')
+$retryMessageMenu = New-Object Windows.Forms.ToolStripMenuItem('重试选中项')
+$removeMessageMenu = New-Object Windows.Forms.ToolStripMenuItem('移除选中项')
+[void]$queueMenu.Items.Add($openMessageMenu)
+[void]$queueMenu.Items.Add($retryMessageMenu)
+[void]$queueMenu.Items.Add((New-Object Windows.Forms.ToolStripSeparator))
+[void]$queueMenu.Items.Add($removeMessageMenu)
+$script:QueueList.ContextMenuStrip = $queueMenu
 
 $buttonPanel = New-Object Windows.Forms.Panel
 $buttonPanel.Location = New-Object Drawing.Point(20, 422)
@@ -1252,6 +1574,12 @@ $clearButton.Text = '清理已完成'
 $clearButton.Location = New-Object Drawing.Point(390, 3)
 $clearButton.Size = New-Object Drawing.Size(115, 36)
 $buttonPanel.Controls.Add($clearButton)
+
+$removeButton = New-Object Windows.Forms.Button
+$removeButton.Text = '移除选中项'
+$removeButton.Location = New-Object Drawing.Point(515, 3)
+$removeButton.Size = New-Object Drawing.Size(120, 36)
+$buttonPanel.Controls.Add($removeButton)
 
 $openButton = New-Object Windows.Forms.Button
 $openButton.Text = '打开下载目录'
@@ -1314,8 +1642,10 @@ $pasteButton.Add_Click({
                     $script:LinkBox.Text = $clip
                 }
                 else {
-                    $script:LinkBox.AppendText("`r`n$clip")
+                    $script:LinkBox.AppendText([Environment]::NewLine + $clip)
                 }
+                $script:LinkBox.Focus()
+                $script:LinkBox.SelectionStart = $script:LinkBox.TextLength
             }
         }
     }
@@ -1325,37 +1655,41 @@ $pasteButton.Add_Click({
 })
 
 $addButton.Add_Click({
-    $valid = 0
-    $invalid = New-Object System.Collections.Generic.List[string]
-    foreach ($line in ($script:LinkBox.Text -split "`r?`n")) {
-        $url = $line.Trim()
-        if ([string]::IsNullOrWhiteSpace($url)) { continue }
-        if (Test-TelegramMessageUrl $url) {
-            if (Add-QueueUrl $url) { $valid++ }
-        }
-        else {
-            $invalid.Add($url)
-        }
-    }
-    if ($valid -gt 0) {
-        $script:LinkBox.Clear()
-        Append-Log "已加入 $valid 个链接。"
-        if ([bool]$script:Settings.AutoStart) {
-            $script:DownloadPaused = $false
-            Start-NextDownload
-        }
-    }
-    if ($invalid.Count -gt 0) {
+    $urls = @(Get-TelegramMessageUrls $script:LinkBox.Text)
+    if ($urls.Count -eq 0) {
         [void][Windows.Forms.MessageBox]::Show(
             $script:MainForm,
-            "以下内容不像 Telegram 消息链接：`r`n$($invalid -join "`r`n")",
-            '链接格式不正确',
+            '没有识别到 Telegram 消息链接。请粘贴形如 https://t.me/频道名/123 的单条消息链接。',
+            '未找到消息链接',
             'OK',
-            'Warning'
+            'Information'
         )
+        return
+    }
+
+    $added = 0
+    foreach ($url in $urls) {
+        if (Add-QueueUrl $url) { $added++ }
+    }
+    $skipped = $urls.Count - $added
+    $script:LinkBox.Clear()
+    $summary = "已加入 $added 个链接"
+    if ($skipped -gt 0) { $summary += "，跳过 $skipped 个重复项" }
+    Append-Log ($summary + '。')
+    Update-QueueSummary
+
+    if ($added -gt 0 -and [bool]$script:Settings.AutoStart) {
+        $script:DownloadPaused = $false
+        Start-NextDownload
     }
 })
 
+$script:LinkBox.Add_KeyDown({
+    if ($_.Control -and $_.KeyCode -eq [Windows.Forms.Keys]::Enter) {
+        $_.SuppressKeyPress = $true
+        $addButton.PerformClick()
+    }
+})
 $script:StartButton.Add_Click({
     foreach ($row in $script:QueueList.SelectedItems) {
         if ($row.Tag.Status -in @('失败', '已停止')) {
@@ -1375,20 +1709,8 @@ $script:StopButton.Add_Click({
     }
 })
 
-$retryButton.Add_Click({
-    if ($script:QueueList.SelectedItems.Count -eq 0) {
-        [void][Windows.Forms.MessageBox]::Show($script:MainForm, '请先在队列中选择需要重试的项目。', '重试', 'OK', 'Information')
-        return
-    }
-    foreach ($row in $script:QueueList.SelectedItems) {
-        if ($row.Tag.Status -in @('失败', '已停止')) {
-            $row.Tag.Attempts = 0
-            Update-QueueRow $row '等待中' ''
-        }
-    }
-    $script:DownloadPaused = $false
-    Start-NextDownload
-})
+$retryButton.Add_Click({ Retry-SelectedQueueItems })
+$removeButton.Add_Click({ Remove-SelectedQueueItems })
 
 $clearButton.Add_Click({
     $remove = @()
@@ -1397,8 +1719,20 @@ $clearButton.Add_Click({
     }
     foreach ($row in $remove) { $script:QueueList.Items.Remove($row) }
     Save-Queue
+    Update-QueueSummary
+    if ($remove.Count -gt 0) { Append-Log "已清理 $($remove.Count) 个已完成项目。" }
 })
 
+$openMessageMenu.Add_Click({ Open-SelectedTelegramMessage })
+$retryMessageMenu.Add_Click({ Retry-SelectedQueueItems })
+$removeMessageMenu.Add_Click({ Remove-SelectedQueueItems })
+$script:QueueList.Add_DoubleClick({ Open-SelectedTelegramMessage })
+$script:QueueList.Add_KeyDown({
+    if ($_.KeyCode -eq [Windows.Forms.Keys]::Delete) {
+        $_.SuppressKeyPress = $true
+        Remove-SelectedQueueItems
+    }
+})
 $openButton.Add_Click({
     try {
         Ensure-Directory ([string]$script:Settings.DownloadDirectory)
@@ -1413,15 +1747,27 @@ $settingsButton.Add_Click({ Show-SettingsDialog })
 $loginButton.Add_Click({ Show-LoginDialog })
 $script:AccountRefreshButton.Add_Click({ Start-AccountRefresh })
 $helpButton.Add_Click({
+    $helpText = "tdl Chinese GUI v$script:AppVersion" +
+        [Environment]::NewLine + [Environment]::NewLine +
+        '1. 首次使用先点右上角【登录 / 更换账号】扫码。' + [Environment]::NewLine +
+        '2. 粘贴消息链接或一整段聊天文字，程序会自动识别链接。' + [Environment]::NewLine +
+        '3. 点击【加入下载队列】；也可以按 Ctrl+Enter。' + [Environment]::NewLine +
+        '4. 队列支持右键打开原消息、重试或移除；Delete 可移除选中项。' + [Environment]::NewLine +
+        '5. 下载失败会按设置自动重试，完成后可显示系统通知。' +
+        [Environment]::NewLine + [Environment]::NewLine +
+        '提示：账号必须能访问原消息；已经被删除或无权限的文件无法下载。' +
+        [Environment]::NewLine + [Environment]::NewLine +
+        '原项目：iyear/tdl' + [Environment]::NewLine +
+        'https://github.com/iyear/tdl' + [Environment]::NewLine +
+        '本程序是非官方中文图形界面，核心下载能力及相关权利归原作者与贡献者所有。'
     [void][Windows.Forms.MessageBox]::Show(
         $script:MainForm,
-        "使用方法：`r`n`r`n1. 首次使用先点右上角【登录 / 更换账号】并扫码。`r`n2. 顶部会显示当前账号昵称、账号 ID 和连接状态；可点【刷新账号】重新验证。`r`n3. 把 Telegram 消息链接粘贴到输入框，每行一个。`r`n4. 点击【加入下载队列】，程序会连续下载。`r`n5. 下载失败会按照设置自动重试。`r`n`r`n程序关闭时，尚未完成的队列会自动保存。`r`n`r`n原项目：iyear/tdl`r`nhttps://github.com/iyear/tdl`r`n本程序是非官方中文图形界面，核心下载能力及相关权利归原作者与贡献者所有。",
+        $helpText,
         '使用帮助',
         'OK',
         'Information'
     )
 })
-
 $pollTimer = New-Object Windows.Forms.Timer
 $pollTimer.Interval = 350
 $pollTimer.Add_Tick({
@@ -1439,7 +1785,8 @@ $pollTimer.Add_Tick({
             $_ -notmatch '^(CPU|Memory|Goroutines|Progress)'
         })
         foreach ($line in ($lines | Select-Object -Last 8)) {
-            Append-Log $line
+            $safeLine = [regex]::Replace($line, '(?i)https?://(?:t\.me|telegram\.me)/[^\s]+', '[Telegram 消息链接]')
+            Append-Log $safeLine
         }
         $percentMatches = [regex]::Matches($clean, '(?<p>\d{1,3}(?:\.\d+)?)%')
         if ($percentMatches.Count -gt 0) {
@@ -1461,7 +1808,16 @@ $script:MainForm.Add_Shown({
     Load-AccountCache
     Update-LoginIndicator
     Load-Queue
-    Append-Log '中文版控制窗口已启动。'
+    Append-Log "tdl Chinese GUI v$script:AppVersion 已启动。"
+
+    if (-not (Test-TdlReady)) {
+        if (-not $script:MainForm.IsDisposed) {
+            $script:StatusLabel.Text = '缺少 tdl.exe，请运行一键安装器'
+        }
+        return
+    }
+
+    Show-FirstRunWelcome
     if (Test-Path -LiteralPath $script:SessionPath) {
         Start-AccountRefresh -Quiet
     }
@@ -1470,7 +1826,6 @@ $script:MainForm.Add_Shown({
     }
     $pollTimer.Start()
 })
-
 $script:MainForm.Add_FormClosing({
     if ($null -ne $script:ActiveRun -and -not $script:ActiveRun.Process.HasExited) {
         $answer = [Windows.Forms.MessageBox]::Show(
@@ -1500,17 +1855,26 @@ $script:MainForm.Add_FormClosed({
         try { $script:InstanceMutex.ReleaseMutex() } catch {}
         $script:InstanceMutex.Dispose()
         $script:InstanceMutex = $null
-    }    $pollTimer.Stop()
+    }
+    $pollTimer.Stop()
     $pollTimer.Dispose()
     if ($null -ne $script:ActiveRun) {
         Complete-CapturedRun $script:ActiveRun
         try { $script:ActiveRun.Process.Dispose() } catch {}
+        Remove-CapturedRunFiles $script:ActiveRun
     }
     if ($null -ne $script:AccountRun) {
         Stop-AccountRefresh
     }
+    if ($null -ne $script:NotifyTimer) {
+        $script:NotifyTimer.Stop()
+        $script:NotifyTimer.Dispose()
+    }
+    if ($null -ne $script:NotifyIcon) {
+        $script:NotifyIcon.Visible = $false
+        $script:NotifyIcon.Dispose()
+    }
 })
-
 if ($AccountSelfTest) {
     Load-AccountCache
     Update-LoginIndicator

@@ -1,6 +1,6 @@
 # tdl Chinese GUI
 
-[简体中文](README.md) · [Issues](https://github.com/fromChina-001/tdl-chinese-gui/issues) · [Upstream tdl](https://github.com/iyear/tdl)
+[简体中文](README.md) · [FAQ (Chinese)](docs/FAQ.md) · [Issues](https://github.com/fromChina-001/tdl-chinese-gui/issues) · [Upstream tdl](https://github.com/iyear/tdl)
 
 A Windows GUI wrapper for [iyear/tdl](https://github.com/iyear/tdl), designed for users who prefer a Chinese graphical interface over the command line.
 
@@ -8,7 +8,7 @@ A Windows GUI wrapper for [iyear/tdl](https://github.com/iyear/tdl), designed fo
 
 ## Upstream project and attribution
 
-The Telegram login, message resolution, and file-transfer capabilities are provided by the upstream open-source project **[iyear/tdl](https://github.com/iyear/tdl)**.
+Telegram login, message resolution, and file transfer are provided by **[iyear/tdl](https://github.com/iyear/tdl)**.
 
 - Upstream project: [iyear/tdl](https://github.com/iyear/tdl)
 - Original author: [iyear](https://github.com/iyear) and tdl contributors
@@ -16,28 +16,39 @@ The Telegram login, message resolution, and file-transfer capabilities are provi
 - Upstream license: [GNU AGPL v3.0](https://github.com/iyear/tdl/blob/master/LICENSE)
 - This repository: an unofficial Windows Chinese GUI for tdl
 
-This project does not claim ownership of the tdl core or brand. It contains the independent GUI and installer only; tdl.exe is downloaded from the official upstream GitHub Release. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This repository contains the independent GUI and installer only. The installer downloads tdl.exe from the official upstream GitHub Release and verifies its SHA-256 checksum. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Highlights
+## Highlights in v1.1
 
-- Chinese Windows GUI with no visible console window
-- Telegram QR-code login inside the application
-- Account name, Telegram user ID, and connection status
-- Multi-link queue with continuous sequential downloads
-- Automatic retry and persistent unfinished queue
+- Chinese Windows GUI with no visible console
+- First-run guide and missing-core recovery
+- Telegram QR-code login and account status
+- Extracts multiple Telegram message URLs from pasted text
+- Persistent queue with retry, remove, open-original, and status counts
+- Friendly error summaries and optional completion notifications
 - Configurable download directory, proxy, threads, and concurrency
 - Media-group downloading and duplicate-file skipping
-- Works with chats and media the signed-in account is authorized to access
 
 ## Install
 
-Download and extract the repository, then double-click **一键安装或更新.bat**. The installer downloads the tested tdl v0.20.4 Windows x64 release from the official GitHub repository and verifies its SHA-256 checksum.
+Download and extract this repository, then double-click **一键安装或更新.bat**. Keep the extracted folder after installation. The installer downloads the tested tdl v0.20.4 Windows x64 release and creates shortcuts.
 
-## Privacy
+For a network that requires an HTTP proxy:
 
-Telegram sessions, account cache, message URLs, settings, logs, downloaded media, and tdl.exe are excluded from Git. Never upload your **.tdl** session directory.
+~~~powershell
+powershell -ExecutionPolicy Bypass -File .\一键安装或更新.ps1 -Proxy 'http://127.0.0.1:7890' -Launch
+~~~
 
-## Limitations
+## Usage
+
+1. Click **登录 / 更换账号** and scan the QR code from Telegram.
+2. Paste message URLs or text containing several message URLs.
+3. Click **加入下载队列**, or press **Ctrl+Enter**.
+4. Double-click a queued item to open the original message; press **Delete** to remove selected items.
+
+## Privacy and limitations
+
+Telegram sessions, account cache, message URLs, settings, temporary logs, downloaded media, and tdl.exe are excluded from Git. Never upload your **.tdl** session directory.
 
 This project does not bypass Telegram access controls and cannot restore media that is no longer accessible to the signed-in account. Use it only for content you are authorized to save.
 
