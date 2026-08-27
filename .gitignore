@@ -1,0 +1,25 @@
+# Runtime and private data
+downloads/
+gui-runtime/
+gui-account.json
+gui-queue.json
+gui-settings.json
+*.session
+*.log
+
+# Downloaded upstream binaries
+tdl.exe
+tdl_*.zip
+tdl_*.tar.gz
+tdl_checksums.txt
+
+# Machine-specific launchers
+*.lnk
+
+# Temporary and editor files
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

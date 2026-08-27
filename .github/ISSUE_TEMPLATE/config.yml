@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 上游 tdl 问题
+    url: https://github.com/iyear/tdl/issues
+    about: 仅在确认问题来自 tdl 命令行本身时前往上游反馈
