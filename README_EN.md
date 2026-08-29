@@ -18,12 +18,13 @@ Telegram login, message resolution, and file transfer are provided by **[iyear/t
 
 This repository contains the independent GUI and installer only. The installer downloads tdl.exe from the official upstream GitHub Release and verifies its SHA-256 checksum. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Highlights in v1.1
+## Highlights in v1.2
 
 - Chinese Windows GUI with no visible console
 - First-run guide and missing-core recovery
 - Telegram QR-code login and account status
 - Extracts multiple Telegram message URLs from pasted text
+- Downloads recent media from bots and protected chats without requiring a message URL
 - Persistent queue with retry, remove, open-original, and status counts
 - Friendly error summaries and optional completion notifications
 - Configurable download directory, proxy, threads, and concurrency
@@ -43,8 +44,9 @@ powershell -ExecutionPolicy Bypass -File .\一键安装或更新.ps1 -Proxy 'htt
 
 1. Click **登录 / 更换账号** and scan the QR code from Telegram.
 2. Paste message URLs or text containing several message URLs.
-3. Click **加入下载队列**, or press **Ctrl+Enter**.
-4. Double-click a queued item to open the original message; press **Delete** to remove selected items.
+3. Click **加入链接队列**, or press **Ctrl+Enter**.
+4. For a bot or protected chat without message links, click **机器人 / 无链接下载**, select the chat, and download its most recent media.
+5. Double-click a linked queue item to open the original message; press **Delete** to remove selected items.
 
 ## Privacy and limitations
 

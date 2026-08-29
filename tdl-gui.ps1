@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.1.0'
+$script:AppVersion = '1.2.0'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -77,6 +77,16 @@ function Ensure-Directory {
 Ensure-Directory $script:DownloadsDefault
 Ensure-Directory $script:RuntimeDir
 
+function Remove-StaleRuntimeFiles {
+    if (-not (Test-Path -LiteralPath $script:RuntimeDir)) { return }
+    $staleBefore = (Get-Date).AddDays(-1)
+    foreach ($pattern in @('*.out.log', '*.err.log', 'protected-*.json')) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $script:RuntimeDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+            if ($file.LastWriteTime -gt $staleBefore) { continue }
+            try { Remove-Item -LiteralPath $file.FullName -Force } catch {}
+        }
+    }
+}
 function Get-DefaultSettings {
     return [ordered]@{
         DownloadDirectory = $script:DownloadsDefault
@@ -329,6 +339,88 @@ function Get-DownloadArguments {
     return $arguments.ToArray()
 }
 
+function Get-ChatListArguments {
+    $arguments = Get-CommonArguments
+    foreach ($argument in @('chat', 'ls', '-o', 'json')) {
+        $arguments.Add([string]$argument)
+    }
+    return $arguments.ToArray()
+}
+
+function Get-ChatExportArguments {
+    param(
+        [string]$ChatId,
+        [int]$MediaCount,
+        [string]$OutputPath
+    )
+    $arguments = Get-CommonArguments
+    foreach ($argument in @('chat', 'export', '-c', $ChatId, '-T', 'last', '-i', [string]$MediaCount, '-o', $OutputPath)) {
+        $arguments.Add([string]$argument)
+    }
+    return $arguments.ToArray()
+}
+
+function Get-ExportDownloadArguments {
+    param([string]$ExportPath)
+    $arguments = Get-CommonArguments
+    $arguments.Add('--threads')
+    $arguments.Add([string][int]$script:Settings.Threads)
+    $arguments.Add('--limit')
+    $arguments.Add([string][int]$script:Settings.Limit)
+    $arguments.Add('dl')
+    $arguments.Add('-f')
+    $arguments.Add($ExportPath)
+    $arguments.Add('-d')
+    $arguments.Add([string]$script:Settings.DownloadDirectory)
+    if ([bool]$script:Settings.SkipSame) { $arguments.Add('--skip-same') }
+    if ([bool]$script:Settings.GroupMedia) { $arguments.Add('--group') }
+    return $arguments.ToArray()
+}
+
+function ConvertFrom-TdlChatListJson {
+    param([string]$Text)
+    $result = New-Object System.Collections.Generic.List[object]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $result.ToArray() }
+
+    $clean = Remove-AnsiCodes $Text
+    $start = $clean.IndexOf('[')
+    $end = $clean.LastIndexOf(']')
+    if ($start -lt 0 -or $end -lt $start) {
+        throw '聊天列表返回格式不正确。'
+    }
+
+    $data = $clean.Substring($start, ($end - $start) + 1) | ConvertFrom-Json
+    foreach ($entry in @($data)) {
+        $id = [string]$entry.id
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+        $type = [string]$entry.type
+        $name = [string]$entry.visible_name
+        $username = [string]$entry.username
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            $name = if ([string]::IsNullOrWhiteSpace($username)) { "聊天 $id" } else { "@$username" }
+        }
+        $isBot = ($type -eq 'private' -and $username -match '(?i)bot$')
+        $result.Add([pscustomobject]@{
+            Id          = $id
+            Type        = $type
+            VisibleName = $name
+            Username    = $username
+            IsBot       = $isBot
+        })
+    }
+    return $result.ToArray()
+}
+
+function Get-TdlChatTypeLabel {
+    param($Chat)
+    if ($null -ne $Chat -and [bool]$Chat.IsBot) { return '机器人' }
+    switch ([string]$Chat.Type) {
+        'private' { return '私聊' }
+        'channel' { return '频道' }
+        'group'   { return '群组' }
+        default   { return '其他' }
+    }
+}
 function Normalize-TelegramMessageUrl {
     param([string]$Url)
     if ([string]::IsNullOrWhiteSpace($Url)) { return '' }
@@ -368,6 +460,9 @@ function Get-FriendlyTdlError {
     param([string]$Text, [int]$ExitCode)
 
     $clean = Remove-AnsiCodes $Text
+    if ($clean -match '(?is)(open kv storage|open db).*(access is denied|permission denied)') {
+        return 'tdl 登录数据正被另一个任务占用，请等待当前下载结束，或关闭其他 tdl 窗口后重试。'
+    }
     if ($clean -match '(?i)(timeout|deadline exceeded|i/o timeout|connection refused|network is unreachable|no such host)') {
         return '网络连接失败，请检查网络或在“设置”中配置代理。'
     }
@@ -986,6 +1081,423 @@ function Finish-CurrentDownload {
         Start-NextDownload
     }
 }
+function Show-ProtectedChatDialog {
+    if (-not (Test-Path -LiteralPath $script:SessionPath)) {
+        [void][Windows.Forms.MessageBox]::Show(
+            $script:MainForm,
+            '请先登录能够看到该机器人视频的 Telegram 账号。',
+            '机器人 / 受保护聊天下载',
+            'OK',
+            'Information'
+        )
+        return
+    }
+    if (($null -ne $script:ActiveRun -and -not $script:ActiveRun.Process.HasExited) -or
+        ($null -ne $script:AccountRun -and -not $script:AccountRun.Process.HasExited) -or
+        ($null -ne $script:LoginRun -and -not $script:LoginRun.Process.HasExited)) {
+        [void][Windows.Forms.MessageBox]::Show(
+            $script:MainForm,
+            '当前有下载、登录或账号刷新任务正在运行，请等待完成后再打开此功能。',
+            '机器人 / 受保护聊天下载',
+            'OK',
+            'Information'
+        )
+        return
+    }
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = '机器人 / 受保护聊天下载'
+    $form.StartPosition = 'CenterParent'
+    $form.FormBorderStyle = 'FixedDialog'
+    $form.MaximizeBox = $false
+    $form.MinimizeBox = $false
+    $form.ClientSize = New-Object Drawing.Size(780, 620)
+    $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
+
+    $title = New-Object Windows.Forms.Label
+    $title.Text = '无需消息链接，直接从机器人或受保护聊天下载'
+    $title.Font = New-Object Drawing.Font('Microsoft YaHei UI', 13, [Drawing.FontStyle]::Bold)
+    $title.Location = New-Object Drawing.Point(22, 18)
+    $title.AutoSize = $true
+    $form.Controls.Add($title)
+
+    $hint = New-Object Windows.Forms.Label
+    $hint.Text = '程序会读取当前账号的聊天列表。机器人会排在最前；默认只下载所选聊天最近 1 个媒体，普通文字消息会自动忽略。'
+    $hint.Location = New-Object Drawing.Point(22, 53)
+    $hint.Size = New-Object Drawing.Size(735, 42)
+    $hint.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($hint)
+
+    $searchLabel = New-Object Windows.Forms.Label
+    $searchLabel.Text = '搜索'
+    $searchLabel.Location = New-Object Drawing.Point(22, 107)
+    $searchLabel.AutoSize = $true
+    $form.Controls.Add($searchLabel)
+
+    $searchBox = New-Object Windows.Forms.TextBox
+    $searchBox.Location = New-Object Drawing.Point(72, 103)
+    $searchBox.Size = New-Object Drawing.Size(495, 28)
+    $form.Controls.Add($searchBox)
+
+    $refreshButton = New-Object Windows.Forms.Button
+    $refreshButton.Text = '刷新聊天列表'
+    $refreshButton.Location = New-Object Drawing.Point(585, 100)
+    $refreshButton.Size = New-Object Drawing.Size(170, 32)
+    $form.Controls.Add($refreshButton)
+
+    $chatList = New-Object Windows.Forms.ListView
+    $chatList.Location = New-Object Drawing.Point(22, 145)
+    $chatList.Size = New-Object Drawing.Size(733, 315)
+    $chatList.View = 'Details'
+    $chatList.FullRowSelect = $true
+    $chatList.GridLines = $true
+    $chatList.HideSelection = $false
+    $chatList.MultiSelect = $false
+    [void]$chatList.Columns.Add('类型', 85)
+    [void]$chatList.Columns.Add('聊天名称', 315)
+    [void]$chatList.Columns.Add('@用户名', 185)
+    [void]$chatList.Columns.Add('聊天 ID', 125)
+    $form.Controls.Add($chatList)
+
+    $countLabel = New-Object Windows.Forms.Label
+    $countLabel.Text = '下载最近的媒体数量'
+    $countLabel.Location = New-Object Drawing.Point(22, 485)
+    $countLabel.AutoSize = $true
+    $form.Controls.Add($countLabel)
+
+    $countBox = New-Object Windows.Forms.NumericUpDown
+    $countBox.Location = New-Object Drawing.Point(175, 481)
+    $countBox.Size = New-Object Drawing.Size(75, 28)
+    $countBox.Minimum = 1
+    $countBox.Maximum = 100
+    $countBox.Value = 1
+    $form.Controls.Add($countBox)
+
+    $countHint = New-Object Windows.Forms.Label
+    $countHint.Text = '建议先保持 1；需要批量下载时再增加。'
+    $countHint.Location = New-Object Drawing.Point(270, 485)
+    $countHint.AutoSize = $true
+    $countHint.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($countHint)
+
+    $progress = New-Object Windows.Forms.ProgressBar
+    $progress.Location = New-Object Drawing.Point(22, 526)
+    $progress.Size = New-Object Drawing.Size(733, 18)
+    $form.Controls.Add($progress)
+
+    $status = New-Object Windows.Forms.Label
+    $status.Text = '准备读取聊天列表'
+    $status.Location = New-Object Drawing.Point(22, 551)
+    $status.Size = New-Object Drawing.Size(430, 42)
+    $status.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($status)
+
+    $openFolderButton = New-Object Windows.Forms.Button
+    $openFolderButton.Text = '打开下载目录'
+    $openFolderButton.Location = New-Object Drawing.Point(454, 565)
+    $openFolderButton.Size = New-Object Drawing.Size(135, 36)
+    $form.Controls.Add($openFolderButton)
+
+    $downloadButton = New-Object Windows.Forms.Button
+    $downloadButton.Text = '开始下载'
+    $downloadButton.Location = New-Object Drawing.Point(598, 565)
+    $downloadButton.Size = New-Object Drawing.Size(100, 36)
+    $downloadButton.BackColor = [Drawing.Color]::FromArgb(0, 120, 212)
+    $downloadButton.ForeColor = [Drawing.Color]::White
+    $downloadButton.FlatStyle = 'Flat'
+    $downloadButton.Enabled = $false
+    $form.Controls.Add($downloadButton)
+
+    $closeButton = New-Object Windows.Forms.Button
+    $closeButton.Text = '关闭'
+    $closeButton.Location = New-Object Drawing.Point(707, 565)
+    $closeButton.Size = New-Object Drawing.Size(48, 36)
+    $form.Controls.Add($closeButton)
+
+    $state = [pscustomobject]@{
+        Run          = $null
+        Phase        = 'idle'
+        Chats        = @()
+        ExportPath   = ''
+        MediaCount   = 1
+    }
+
+    $setBusy = {
+        param([bool]$Busy, [string]$Message)
+        $refreshButton.Enabled = -not $Busy
+        $searchBox.Enabled = -not $Busy
+        $chatList.Enabled = -not $Busy
+        $countBox.Enabled = -not $Busy
+        $downloadButton.Enabled = (-not $Busy -and $chatList.SelectedItems.Count -gt 0)
+        $closeButton.Text = if ($Busy) { '停止' } else { '关闭' }
+        if (-not [string]::IsNullOrWhiteSpace($Message)) { $status.Text = $Message }
+    }.GetNewClosure()
+
+    $removeExport = {
+        if (-not [string]::IsNullOrWhiteSpace([string]$state.ExportPath) -and
+            (Test-Path -LiteralPath $state.ExportPath)) {
+            try { Remove-Item -LiteralPath $state.ExportPath -Force } catch {}
+        }
+        $state.ExportPath = ''
+    }.GetNewClosure()
+
+    $finishError = {
+        param([string]$Message)
+        & $removeExport
+        $state.Phase = 'idle'
+        $progress.Style = 'Blocks'
+        $progress.Value = 0
+        $status.Text = $Message
+        $status.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+        & $setBusy $false ''
+        Append-Log "无链接下载失败：$Message"
+    }.GetNewClosure()
+
+    $renderChats = {
+        $query = $searchBox.Text.Trim()
+        $chatList.BeginUpdate()
+        try {
+            $chatList.Items.Clear()
+            $filtered = @($state.Chats | Where-Object {
+                if ([string]::IsNullOrWhiteSpace($query)) { return $true }
+                return (
+                    [string]$_.VisibleName -like "*$query*" -or
+                    [string]$_.Username -like "*$query*" -or
+                    [string]$_.Id -like "*$query*"
+                )
+            } | Sort-Object @{ Expression = { if ([bool]$_.IsBot) { 0 } else { 1 } } }, @{ Expression = { [string]$_.VisibleName } })
+
+            foreach ($chat in $filtered) {
+                $row = New-Object Windows.Forms.ListViewItem((Get-TdlChatTypeLabel $chat))
+                [void]$row.SubItems.Add([string]$chat.VisibleName)
+                $username = if ([string]::IsNullOrWhiteSpace([string]$chat.Username)) { '—' } else { '@' + ([string]$chat.Username).TrimStart('@') }
+                [void]$row.SubItems.Add($username)
+                [void]$row.SubItems.Add([string]$chat.Id)
+                $row.Tag = $chat
+                [void]$chatList.Items.Add($row)
+            }
+        }
+        finally {
+            $chatList.EndUpdate()
+        }
+        if ($chatList.Items.Count -gt 0) {
+            $chatList.Items[0].Selected = $true
+            $chatList.Items[0].Focused = $true
+            $downloadButton.Enabled = $true
+        }
+        else {
+            $downloadButton.Enabled = $false
+        }
+    }.GetNewClosure()
+
+    $startChatList = {
+        if ($null -ne $state.Run) { return }
+        try {
+            $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
+            $progress.Style = 'Marquee'
+            $progress.MarqueeAnimationSpeed = 24
+            & $setBusy $true '正在读取当前 Telegram 账号的聊天列表，请稍候……'
+            $state.Phase = 'list'
+            $state.Run = Start-HiddenProcessCapture (Get-ChatListArguments) 'protected-list'
+        }
+        catch {
+            $state.Run = $null
+            & $finishError (Get-FriendlyTdlError $_.Exception.Message -1)
+        }
+    }.GetNewClosure()
+
+    $startDownload = {
+        if ($null -ne $state.Run) { return }
+        if ($chatList.SelectedItems.Count -eq 0) {
+            [void][Windows.Forms.MessageBox]::Show($form, '请先选择视频所在的机器人或聊天。', '无链接下载', 'OK', 'Information')
+            return
+        }
+
+        $chat = $chatList.SelectedItems[0].Tag
+        $count = [int]$countBox.Value
+        $answer = [Windows.Forms.MessageBox]::Show(
+            $form,
+            ('将从“' + [string]$chat.VisibleName + '”下载最近 ' + $count + ' 个媒体。普通文字消息会自动忽略。是否继续？'),
+            '确认无链接下载',
+            [Windows.Forms.MessageBoxButtons]::YesNo,
+            [Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
+
+        try {
+            Ensure-Directory $script:RuntimeDir
+            $state.ExportPath = Join-Path $script:RuntimeDir ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
+            $state.MediaCount = $count
+            $state.Phase = 'export'
+            $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
+            $progress.Style = 'Marquee'
+            $progress.MarqueeAnimationSpeed = 24
+            & $setBusy $true "正在从所选聊天查找最近 $count 个媒体……"
+            $state.Run = Start-HiddenProcessCapture (Get-ChatExportArguments ([string]$chat.Id) $count $state.ExportPath) 'protected-export'
+        }
+        catch {
+            $state.Run = $null
+            & $finishError (Get-FriendlyTdlError $_.Exception.Message -1)
+        }
+    }.GetNewClosure()
+
+    $timer = New-Object Windows.Forms.Timer
+    $timer.Interval = 350
+    $timer.Add_Tick({
+        if ($null -eq $state.Run) { return }
+
+        if ($state.Phase -eq 'download') {
+            $downloadText = Remove-AnsiCodes (Get-RunText $state.Run)
+            $matches = [regex]::Matches($downloadText, '(?<p>\d{1,3}(?:\.\d+)?)%')
+            if ($matches.Count -gt 0) {
+                $value = [Math]::Min(100, [Math]::Max(0, [int][double]$matches[$matches.Count - 1].Groups['p'].Value))
+                $progress.Style = 'Continuous'
+                $progress.Value = $value
+                $status.Text = "正在下载：$value%"
+            }
+        }
+
+        if (-not $state.Run.Process.HasExited) { return }
+
+        $run = $state.Run
+        $phase = $state.Phase
+        $exitCode = -1
+        try { $exitCode = $run.Process.ExitCode } catch {}
+        Complete-CapturedRun $run
+        $stdout = Remove-AnsiCodes (Read-SharedUtf8File $run.StdoutPath)
+        $allText = Remove-AnsiCodes (Get-RunText $run)
+        try { $run.Process.Dispose() } catch {}
+        Remove-CapturedRunFiles $run
+        $state.Run = $null
+
+        if ($run.StopRequested) {
+            & $finishError '操作已停止。'
+            return
+        }
+
+        if ($phase -eq 'list') {
+            if ($exitCode -ne 0) {
+                & $finishError (Get-FriendlyTdlError $allText $exitCode)
+                return
+            }
+            try {
+                $state.Chats = @(ConvertFrom-TdlChatListJson $stdout)
+                & $renderChats
+                $progress.Style = 'Blocks'
+                $progress.Value = 0
+                $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+                $botCount = @($state.Chats | Where-Object { [bool]$_.IsBot }).Count
+                $status.Text = "已读取 $($state.Chats.Count) 个聊天，其中识别到 $botCount 个机器人。"
+                $state.Phase = 'idle'
+                & $setBusy $false ''
+            }
+            catch {
+                & $finishError "聊天列表解析失败：$($_.Exception.Message)"
+            }
+            return
+        }
+
+        if ($phase -eq 'export') {
+            if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $state.ExportPath)) {
+                & $finishError (Get-FriendlyTdlError $allText $exitCode)
+                return
+            }
+            try {
+                Ensure-Directory ([string]$script:Settings.DownloadDirectory)
+                $state.Phase = 'download'
+                $status.Text = '已找到媒体，正在开始下载……'
+                $progress.Style = 'Marquee'
+                $progress.MarqueeAnimationSpeed = 24
+                $state.Run = Start-HiddenProcessCapture (Get-ExportDownloadArguments $state.ExportPath) 'protected-download'
+            }
+            catch {
+                $state.Run = $null
+                & $finishError (Get-FriendlyTdlError $_.Exception.Message -1)
+            }
+            return
+        }
+
+        if ($phase -eq 'download') {
+            if ($exitCode -ne 0) {
+                & $finishError (Get-FriendlyTdlError $allText $exitCode)
+                return
+            }
+
+            & $removeExport
+            $state.Phase = 'idle'
+            $progress.Style = 'Continuous'
+            $progress.Value = 100
+            $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+            $status.Text = "下载完成：已处理最近 $($state.MediaCount) 个媒体。"
+            & $setBusy $false ''
+            Append-Log "机器人 / 受保护聊天下载完成，已处理最近 $($state.MediaCount) 个媒体。"
+            [System.Media.SystemSounds]::Asterisk.Play()
+        }
+    }.GetNewClosure())
+
+    $refreshButton.Add_Click($startChatList)
+    $downloadButton.Add_Click($startDownload)
+    $searchBox.Add_TextChanged($renderChats)
+    $chatList.Add_SelectedIndexChanged({
+        if ($state.Phase -eq 'idle') {
+            $downloadButton.Enabled = ($chatList.SelectedItems.Count -gt 0)
+        }
+    }.GetNewClosure())
+    $chatList.Add_DoubleClick({
+        if ($chatList.SelectedItems.Count -gt 0 -and $state.Phase -eq 'idle') {
+            & $startDownload
+        }
+    }.GetNewClosure())
+
+    $openFolderButton.Add_Click({
+        try {
+            Ensure-Directory ([string]$script:Settings.DownloadDirectory)
+            [void][Diagnostics.Process]::Start('explorer.exe', (ConvertTo-NativeArgument ([string]$script:Settings.DownloadDirectory)))
+        }
+        catch {
+            [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法打开目录', 'OK', 'Error')
+        }
+    }.GetNewClosure())
+
+    $closeButton.Add_Click({
+        $form.Close()
+    }.GetNewClosure())
+
+    $form.Add_Shown({
+        $timer.Start()
+        & $startChatList
+    }.GetNewClosure())
+
+    $form.Add_FormClosing({
+        if ($null -eq $state.Run) { return }
+        $answer = [Windows.Forms.MessageBox]::Show(
+            $form,
+            '当前操作尚未完成。关闭窗口会停止读取或下载，确定关闭吗？',
+            '确认停止',
+            [Windows.Forms.MessageBoxButtons]::YesNo,
+            [Windows.Forms.MessageBoxIcon]::Question
+        )
+        if ($answer -ne [Windows.Forms.DialogResult]::Yes) {
+            $_.Cancel = $true
+            return
+        }
+        Stop-CapturedRun $state.Run
+        Complete-CapturedRun $state.Run
+        try { $state.Run.Process.Dispose() } catch {}
+        Remove-CapturedRunFiles $state.Run
+        $state.Run = $null
+        & $removeExport
+    }.GetNewClosure())
+
+    $form.Add_FormClosed({
+        $timer.Stop()
+        $timer.Dispose()
+        & $removeExport
+    }.GetNewClosure())
+
+    [void]$form.ShowDialog($script:MainForm)
+    $form.Dispose()
+}
 function Show-SettingsDialog {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = '下载设置'
@@ -1348,6 +1860,19 @@ if ($SelfTest) {
     if ($linkExtractionTest.Count -ne 2 -or $linkExtractionTest[0] -ne 'https://t.me/demo_channel/123') {
         throw 'SELFTEST: Telegram link extraction failed'
     }
+    $chatJsonTest = '[{"id":123,"type":"private","visible_name":"示例机器人","username":"sample_helper_bot"},{"id":456,"type":"group","visible_name":"示例群","username":""}]'
+    $chatListTest = @(ConvertFrom-TdlChatListJson $chatJsonTest)
+    if ($chatListTest.Count -ne 2 -or -not $chatListTest[0].IsBot -or $chatListTest[1].IsBot) {
+        throw 'SELFTEST: chat list parsing or bot detection failed'
+    }
+    $chatExportTest = Get-ChatExportArguments '123' 1 'D:\temp\protected.json'
+    if ($chatExportTest -notcontains 'export' -or $chatExportTest -notcontains 'last' -or $chatExportTest -notcontains '123') {
+        throw 'SELFTEST: protected chat export arguments are incomplete'
+    }
+    $fileDownloadTest = Get-ExportDownloadArguments 'D:\temp\protected.json'
+    if ($fileDownloadTest -notcontains '-f' -or $fileDownloadTest -notcontains 'D:\temp\protected.json') {
+        throw 'SELFTEST: exported file download arguments are incomplete'
+    }
     Write-Output 'SELFTEST_OK'
     Write-Output ($testOutput.Trim())
     exit 0
@@ -1459,7 +1984,7 @@ $script:DownloadPathLabel.ForeColor = [Drawing.Color]::DimGray
 $loginPanel.Controls.Add($script:DownloadPathLabel)
 
 $privacyLabel = New-Object Windows.Forms.Label
-$privacyLabel.Text = '界面不显示手机号 / @用户名'
+$privacyLabel.Text = '聊天资料仅在本机使用'
 $privacyLabel.Location = New-Object Drawing.Point(725, 42)
 $privacyLabel.Size = New-Object Drawing.Size(220, 22)
 $privacyLabel.Anchor = 'Top,Right'
@@ -1470,7 +1995,7 @@ $loginPanel.Controls.Add($privacyLabel)
 Update-LoginIndicator
 
 $linkGroup = New-Object Windows.Forms.GroupBox
-$linkGroup.Text = '粘贴链接或聊天文字（自动识别 Telegram 消息链接）'
+$linkGroup.Text = '有消息链接时粘贴到这里；无链接请使用右侧机器人下载'
 $linkGroup.Location = New-Object Drawing.Point(20, 91)
 $linkGroup.Size = New-Object Drawing.Size(960, 132)
 $linkGroup.Anchor = 'Top,Left,Right'
@@ -1487,20 +2012,30 @@ $linkGroup.Controls.Add($script:LinkBox)
 
 $pasteButton = New-Object Windows.Forms.Button
 $pasteButton.Text = '从剪贴板粘贴'
-$pasteButton.Location = New-Object Drawing.Point(728, 26)
-$pasteButton.Size = New-Object Drawing.Size(216, 36)
+$pasteButton.Location = New-Object Drawing.Point(728, 25)
+$pasteButton.Size = New-Object Drawing.Size(216, 27)
 $pasteButton.Anchor = 'Top,Right'
 $linkGroup.Controls.Add($pasteButton)
 
 $addButton = New-Object Windows.Forms.Button
-$addButton.Text = '加入下载队列'
-$addButton.Location = New-Object Drawing.Point(728, 76)
-$addButton.Size = New-Object Drawing.Size(216, 38)
+$addButton.Text = '加入链接队列'
+$addButton.Location = New-Object Drawing.Point(728, 57)
+$addButton.Size = New-Object Drawing.Size(216, 27)
 $addButton.Anchor = 'Top,Right'
 $addButton.BackColor = [Drawing.Color]::FromArgb(0, 120, 212)
 $addButton.ForeColor = [Drawing.Color]::White
 $addButton.FlatStyle = 'Flat'
 $linkGroup.Controls.Add($addButton)
+
+$protectedButton = New-Object Windows.Forms.Button
+$protectedButton.Text = '机器人 / 无链接下载'
+$protectedButton.Location = New-Object Drawing.Point(728, 89)
+$protectedButton.Size = New-Object Drawing.Size(216, 27)
+$protectedButton.Anchor = 'Top,Right'
+$protectedButton.BackColor = [Drawing.Color]::FromArgb(111, 66, 193)
+$protectedButton.ForeColor = [Drawing.Color]::White
+$protectedButton.FlatStyle = 'Flat'
+$linkGroup.Controls.Add($protectedButton)
 
 $queueLabel = New-Object Windows.Forms.Label
 $queueLabel.Text = '下载队列'
@@ -1744,16 +2279,18 @@ $openButton.Add_Click({
 })
 
 $settingsButton.Add_Click({ Show-SettingsDialog })
+$protectedButton.Add_Click({ Show-ProtectedChatDialog })
 $loginButton.Add_Click({ Show-LoginDialog })
 $script:AccountRefreshButton.Add_Click({ Start-AccountRefresh })
 $helpButton.Add_Click({
     $helpText = "tdl Chinese GUI v$script:AppVersion" +
         [Environment]::NewLine + [Environment]::NewLine +
         '1. 首次使用先点右上角【登录 / 更换账号】扫码。' + [Environment]::NewLine +
-        '2. 粘贴消息链接或一整段聊天文字，程序会自动识别链接。' + [Environment]::NewLine +
-        '3. 点击【加入下载队列】；也可以按 Ctrl+Enter。' + [Environment]::NewLine +
-        '4. 队列支持右键打开原消息、重试或移除；Delete 可移除选中项。' + [Environment]::NewLine +
-        '5. 下载失败会按设置自动重试，完成后可显示系统通知。' +
+        '2. 有消息链接时可粘贴链接或整段聊天文字，程序会自动识别。' + [Environment]::NewLine +
+        '3. 机器人不提供消息链接时，点击【机器人 / 无链接下载】。' + [Environment]::NewLine +
+        '4. 选择机器人，默认下载最近 1 个媒体；普通文字会自动忽略。' + [Environment]::NewLine +
+        '5. 链接队列支持重试、移除和打开原消息。' + [Environment]::NewLine +
+        '6. 下载失败会按设置自动重试，完成后可显示系统通知。' +
         [Environment]::NewLine + [Environment]::NewLine +
         '提示：账号必须能访问原消息；已经被删除或无权限的文件无法下载。' +
         [Environment]::NewLine + [Environment]::NewLine +
@@ -1805,6 +2342,7 @@ $script:MainForm.Add_Shown({
     if (-not [string]::IsNullOrWhiteSpace($RenderPreview)) { return }
     [void][TdlGuiNative]::ShowWindow($script:MainForm.Handle, 5)
     [void][TdlGuiNative]::SetForegroundWindow($script:MainForm.Handle)
+    Remove-StaleRuntimeFiles
     Load-AccountCache
     Update-LoginIndicator
     Load-Queue
