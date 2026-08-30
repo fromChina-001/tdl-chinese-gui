@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.2.0'
+$script:AppVersion = '1.2.1'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -391,11 +391,15 @@ function ConvertFrom-TdlChatListJson {
 
     $data = $clean.Substring($start, ($end - $start) + 1) | ConvertFrom-Json
     foreach ($entry in @($data)) {
-        $id = [string]$entry.id
+        $idProperty = $entry.PSObject.Properties['id']
+        $typeProperty = $entry.PSObject.Properties['type']
+        $nameProperty = $entry.PSObject.Properties['visible_name']
+        $usernameProperty = $entry.PSObject.Properties['username']
+        $id = if ($null -eq $idProperty) { '' } else { [string]$idProperty.Value }
         if ([string]::IsNullOrWhiteSpace($id)) { continue }
-        $type = [string]$entry.type
-        $name = [string]$entry.visible_name
-        $username = [string]$entry.username
+        $type = if ($null -eq $typeProperty) { '' } else { [string]$typeProperty.Value }
+        $name = if ($null -eq $nameProperty) { '' } else { [string]$nameProperty.Value }
+        $username = if ($null -eq $usernameProperty) { '' } else { [string]$usernameProperty.Value }
         if ([string]::IsNullOrWhiteSpace($name)) {
             $name = if ([string]::IsNullOrWhiteSpace($username)) { "聊天 $id" } else { "@$username" }
         }
@@ -1860,9 +1864,9 @@ if ($SelfTest) {
     if ($linkExtractionTest.Count -ne 2 -or $linkExtractionTest[0] -ne 'https://t.me/demo_channel/123') {
         throw 'SELFTEST: Telegram link extraction failed'
     }
-    $chatJsonTest = '[{"id":123,"type":"private","visible_name":"示例机器人","username":"sample_helper_bot"},{"id":456,"type":"group","visible_name":"示例群","username":""}]'
+    $chatJsonTest = '[{"id":123,"type":"private","visible_name":"示例机器人","username":"sample_helper_bot"},{"id":456,"type":"group","visible_name":"示例群"}]'
     $chatListTest = @(ConvertFrom-TdlChatListJson $chatJsonTest)
-    if ($chatListTest.Count -ne 2 -or -not $chatListTest[0].IsBot -or $chatListTest[1].IsBot) {
+    if ($chatListTest.Count -ne 2 -or -not $chatListTest[0].IsBot -or $chatListTest[1].IsBot -or $chatListTest[1].Username -ne '') {
         throw 'SELFTEST: chat list parsing or bot detection failed'
     }
     $chatExportTest = Get-ChatExportArguments '123' 1 'D:\temp\protected.json'

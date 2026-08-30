@@ -6,7 +6,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell)
-![GUI](https://img.shields.io/badge/GUI-v1.2.0-16A085)
+![GUI](https://img.shields.io/badge/GUI-v1.2.1-16A085)
 ![tdl](https://img.shields.io/badge/tdl-v0.20.4-2CA5E0)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
