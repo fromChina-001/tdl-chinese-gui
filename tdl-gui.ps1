@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.2.1'
+$script:AppVersion = '1.2.2'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -69,6 +69,9 @@ $script:NotifyTimer = $null
 
 function Ensure-Directory {
     param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        throw '程序内部目录为空，请重新打开软件；如果仍出现，请反馈运行日志。'
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         [void](New-Item -ItemType Directory -Path $Path -Force)
     }
@@ -232,6 +235,7 @@ function Start-HiddenProcessCapture {
 
 function Read-SharedUtf8File {
     param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
     if (-not (Test-Path -LiteralPath $Path)) {
         return ''
     }
@@ -1226,6 +1230,14 @@ function Show-ProtectedChatDialog {
         MediaCount   = 1
     }
 
+    # GetNewClosure uses a dynamic script scope. Capture application paths as local values
+    # so button and timer events never resolve $script:* against that temporary scope.
+    $runtimeDirectory = [string]$script:RuntimeDir
+    $downloadDirectory = [string]$script:Settings.DownloadDirectory
+    if ([string]::IsNullOrWhiteSpace($downloadDirectory)) {
+        $downloadDirectory = [string]$script:DownloadsDefault
+    }
+
     $setBusy = {
         param([bool]$Busy, [string]$Message)
         $refreshButton.Enabled = -not $Busy
@@ -1329,8 +1341,8 @@ function Show-ProtectedChatDialog {
         if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
 
         try {
-            Ensure-Directory $script:RuntimeDir
-            $state.ExportPath = Join-Path $script:RuntimeDir ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
+            Ensure-Directory $runtimeDirectory
+            $state.ExportPath = Join-Path $runtimeDirectory ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
             $state.MediaCount = $count
             $state.Phase = 'export'
             $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
@@ -1407,7 +1419,7 @@ function Show-ProtectedChatDialog {
                 return
             }
             try {
-                Ensure-Directory ([string]$script:Settings.DownloadDirectory)
+                Ensure-Directory $downloadDirectory
                 $state.Phase = 'download'
                 $status.Text = '已找到媒体，正在开始下载……'
                 $progress.Style = 'Marquee'
@@ -1455,8 +1467,8 @@ function Show-ProtectedChatDialog {
 
     $openFolderButton.Add_Click({
         try {
-            Ensure-Directory ([string]$script:Settings.DownloadDirectory)
-            [void][Diagnostics.Process]::Start('explorer.exe', (ConvertTo-NativeArgument ([string]$script:Settings.DownloadDirectory)))
+            Ensure-Directory $downloadDirectory
+            [void][Diagnostics.Process]::Start('explorer.exe', (ConvertTo-NativeArgument $downloadDirectory))
         }
         catch {
             [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法打开目录', 'OK', 'Error')
@@ -1876,6 +1888,17 @@ if ($SelfTest) {
     $fileDownloadTest = Get-ExportDownloadArguments 'D:\temp\protected.json'
     if ($fileDownloadTest -notcontains '-f' -or $fileDownloadTest -notcontains 'D:\temp\protected.json') {
         throw 'SELFTEST: exported file download arguments are incomplete'
+    }
+    $capturedRuntimeDirectoryTest = [string]$script:RuntimeDir
+    $capturedDownloadDirectoryTest = [string]$script:Settings.DownloadDirectory
+    $protectedPathClosureTest = {
+        return @($capturedRuntimeDirectoryTest, $capturedDownloadDirectoryTest)
+    }.GetNewClosure()
+    $protectedPathValues = @(& $protectedPathClosureTest)
+    if ($protectedPathValues.Count -ne 2 -or
+        [string]::IsNullOrWhiteSpace([string]$protectedPathValues[0]) -or
+        [string]::IsNullOrWhiteSpace([string]$protectedPathValues[1])) {
+        throw 'SELFTEST: protected dialog paths were lost inside closure'
     }
     Write-Output 'SELFTEST_OK'
     Write-Output ($testOutput.Trim())
