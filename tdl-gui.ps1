@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.2.2'
+$script:AppVersion = '1.3.0'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -74,6 +74,28 @@ function Ensure-Directory {
     }
     if (-not (Test-Path -LiteralPath $Path)) {
         [void](New-Item -ItemType Directory -Path $Path -Force)
+    }
+}
+
+function Assert-DirectoryWritable {
+    param([string]$Path)
+    Ensure-Directory $Path
+    $probePath = Join-Path $Path ('.tdl-write-test-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $stream = $null
+    try {
+        $stream = New-Object IO.FileStream(
+            $probePath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+    }
+    catch {
+        throw '下载目录无法写入，请使用更改保存目录按钮选择其他位置。'
+    }
+    finally {
+        if ($null -ne $stream) { try { $stream.Dispose() } catch {} }
+        if (Test-Path -LiteralPath $probePath) { try { Remove-Item -LiteralPath $probePath -Force } catch {} }
     }
 }
 
@@ -121,13 +143,36 @@ function Load-Settings {
             # Keep safe defaults when an old settings file is invalid.
         }
     }
+    if ([string]::IsNullOrWhiteSpace([string]$defaults.DownloadDirectory)) {
+        $defaults.DownloadDirectory = $script:DownloadsDefault
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$defaults.ProxyAddress)) {
+        $defaults.ProxyAddress = 'http://127.0.0.1:7890'
+    }
+    try { $defaults.Threads = [Math]::Min(16, [Math]::Max(1, [int]$defaults.Threads)) } catch { $defaults.Threads = 4 }
+    try { $defaults.Limit = [Math]::Min(8, [Math]::Max(1, [int]$defaults.Limit)) } catch { $defaults.Limit = 2 }
+    try { $defaults.RetryCount = [Math]::Min(5, [Math]::Max(0, [int]$defaults.RetryCount)) } catch { $defaults.RetryCount = 2 }
     return $defaults
 }
 
 $script:Settings = Load-Settings
+if (-not [string]::IsNullOrWhiteSpace($RenderPreview)) {
+    $script:Settings.DownloadDirectory = 'D:\Telegram Downloads'
+    $script:Settings.ProxyEnabled = $false
+}
 
 function Save-Settings {
     $script:Settings | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:SettingsPath -Encoding UTF8
+}
+
+function Set-DownloadDirectorySetting {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return }
+    $script:Settings.DownloadDirectory = $Path
+    Save-Settings
+    if ($null -ne $script:DownloadPathLabel) {
+        $script:DownloadPathLabel.Text = $Path
+    }
 }
 
 function ConvertTo-NativeArgument {
@@ -365,7 +410,13 @@ function Get-ChatExportArguments {
 }
 
 function Get-ExportDownloadArguments {
-    param([string]$ExportPath)
+    param(
+        [string]$ExportPath,
+        [string]$DownloadDirectory = ''
+    )
+    if ([string]::IsNullOrWhiteSpace($DownloadDirectory)) {
+        $DownloadDirectory = [string]$script:Settings.DownloadDirectory
+    }
     $arguments = Get-CommonArguments
     $arguments.Add('--threads')
     $arguments.Add([string][int]$script:Settings.Threads)
@@ -375,7 +426,7 @@ function Get-ExportDownloadArguments {
     $arguments.Add('-f')
     $arguments.Add($ExportPath)
     $arguments.Add('-d')
-    $arguments.Add([string]$script:Settings.DownloadDirectory)
+    $arguments.Add($DownloadDirectory)
     if ([bool]$script:Settings.SkipSame) { $arguments.Add('--skip-same') }
     if ([bool]$script:Settings.GroupMedia) { $arguments.Add('--group') }
     return $arguments.ToArray()
@@ -480,6 +531,12 @@ function Get-FriendlyTdlError {
     if ($clean -match '(?i)(auth.?key|session.*revoked|unauthorized|not authorized)') {
         return 'Telegram 登录已失效，请点击右上角重新登录。'
     }
+    if ($clean -match '(?i)(no downloadable|no media|no messages|nothing to download|empty export)') {
+        return '没有找到可下载的媒体，请确认聊天中仍能看到图片、视频或文件。'
+    }
+    if ($clean -match '(?i)(chat not found|cannot find chat|peer.?id.?invalid)') {
+        return '没有找到该聊天，请刷新列表并确认当前登录账号仍能访问。'
+    }
     if ($clean -match '(?i)(message.?id.?invalid|message not found|channel private|chat.*forbidden|access denied)') {
         return '消息不存在或当前账号无权访问，请检查链接和账号权限。'
     }
@@ -497,6 +554,16 @@ function Get-FriendlyTdlError {
     if ($usefulLines.Count -gt 0) {
         $message = [string]($usefulLines | Select-Object -Last 1)
         $message = [regex]::Replace($message, '(?i)https?://(?:t\.me|telegram\.me)/[^\s]+', '[Telegram 消息链接]')
+        foreach ($privatePath in @(
+            [string]$script:AppDir,
+            [string]$script:RuntimeDir,
+            [string]$script:Settings.DownloadDirectory
+        )) {
+            if (-not [string]::IsNullOrWhiteSpace($privatePath)) {
+                $message = $message.Replace($privatePath, '[本地目录]')
+            }
+        }
+        $message = [regex]::Replace($message, '(?i)C:\\Users\\[^\\\s]+', '%USERPROFILE%')
         if ($message.Length -gt 180) { $message = $message.Substring(0, 180) + '…' }
         return $message
     }
@@ -529,26 +596,17 @@ function Update-QueueSummary {
     $script:QueueSummaryLabel.Text = "共 $($script:QueueList.Items.Count) 条 · 等待 $($counts.Waiting) · 下载中 $($counts.Active) · 失败 $($counts.Failed) · 完成 $($counts.Done)"
 }
 
-function Show-QueueCompletionNotification {
-    if (-not [bool]$script:Settings.CompletionNotification) { return }
+function Show-CompletionNotification {
+    param([string]$Message)
+    if (-not [bool]$script:Settings.CompletionNotification -or [string]::IsNullOrWhiteSpace($Message)) { return }
     try {
         if ($null -eq $script:NotifyIcon) {
             $script:NotifyIcon = New-Object Windows.Forms.NotifyIcon
             $script:NotifyIcon.Icon = [Drawing.SystemIcons]::Information
             $script:NotifyIcon.Text = 'tdl Chinese GUI'
         }
-        $failed = 0
-        foreach ($row in $script:QueueList.Items) {
-            if ($row.Tag.Status -in @('失败', '已停止')) { $failed++ }
-        }
-        $message = if ($failed -gt 0) {
-            "下载队列已处理完毕，其中 $failed 项需要重试。"
-        }
-        else {
-            '下载队列已全部完成。'
-        }
         $script:NotifyIcon.Visible = $true
-        $script:NotifyIcon.ShowBalloonTip(5000, 'Telegram 下载器', $message, [Windows.Forms.ToolTipIcon]::Info)
+        $script:NotifyIcon.ShowBalloonTip(5000, 'Telegram 下载器', $Message, [Windows.Forms.ToolTipIcon]::Info)
         [System.Media.SystemSounds]::Asterisk.Play()
 
         if ($null -eq $script:NotifyTimer) {
@@ -565,6 +623,20 @@ function Show-QueueCompletionNotification {
     catch {
         # Notifications are optional and must never affect downloading.
     }
+}
+
+function Show-QueueCompletionNotification {
+    $failed = 0
+    foreach ($row in $script:QueueList.Items) {
+        if ($row.Tag.Status -in @('失败', '已停止')) { $failed++ }
+    }
+    $message = if ($failed -gt 0) {
+        "下载队列已处理完毕，其中 $failed 项需要重试。"
+    }
+    else {
+        '下载队列已全部完成。'
+    }
+    Show-CompletionNotification $message
 }
 
 function Get-QueueData {
@@ -1119,8 +1191,18 @@ function Show-ProtectedChatDialog {
     $form.FormBorderStyle = 'FixedDialog'
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
-    $form.ClientSize = New-Object Drawing.Size(780, 620)
+    $form.ClientSize = New-Object Drawing.Size(780, 665)
     $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
+
+    # Event closures share these objects, avoiding dynamic script-scope path loss.
+    $pathContext = [pscustomobject]@{
+        RuntimeDirectory  = [string]$script:RuntimeDir
+        DownloadDirectory = [string]$script:Settings.DownloadDirectory
+    }
+    if ([string]::IsNullOrWhiteSpace($pathContext.DownloadDirectory)) {
+        $pathContext.DownloadDirectory = [string]$script:DownloadsDefault
+    }
+    $appVersion = [string]$script:AppVersion
 
     $title = New-Object Windows.Forms.Label
     $title.Text = '无需消息链接，直接从机器人或受保护聊天下载'
@@ -1188,27 +1270,48 @@ function Show-ProtectedChatDialog {
     $countHint.ForeColor = [Drawing.Color]::DimGray
     $form.Controls.Add($countHint)
 
+    $destinationLabel = New-Object Windows.Forms.Label
+    $destinationLabel.Text = '保存到：' + $pathContext.DownloadDirectory
+    $destinationLabel.Location = New-Object Drawing.Point(22, 515)
+    $destinationLabel.Size = New-Object Drawing.Size(580, 24)
+    $destinationLabel.AutoEllipsis = $true
+    $destinationLabel.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($destinationLabel)
+
+    $changeFolderButton = New-Object Windows.Forms.Button
+    $changeFolderButton.Text = '更改保存目录'
+    $changeFolderButton.Location = New-Object Drawing.Point(620, 508)
+    $changeFolderButton.Size = New-Object Drawing.Size(135, 31)
+    $form.Controls.Add($changeFolderButton)
+
     $progress = New-Object Windows.Forms.ProgressBar
-    $progress.Location = New-Object Drawing.Point(22, 526)
+    $progress.Location = New-Object Drawing.Point(22, 552)
     $progress.Size = New-Object Drawing.Size(733, 18)
     $form.Controls.Add($progress)
 
     $status = New-Object Windows.Forms.Label
     $status.Text = '准备读取聊天列表'
-    $status.Location = New-Object Drawing.Point(22, 551)
-    $status.Size = New-Object Drawing.Size(430, 42)
+    $status.Location = New-Object Drawing.Point(22, 578)
+    $status.Size = New-Object Drawing.Size(733, 27)
     $status.ForeColor = [Drawing.Color]::DimGray
     $form.Controls.Add($status)
 
+    $copyErrorButton = New-Object Windows.Forms.Button
+    $copyErrorButton.Text = '复制错误信息'
+    $copyErrorButton.Location = New-Object Drawing.Point(330, 610)
+    $copyErrorButton.Size = New-Object Drawing.Size(105, 36)
+    $copyErrorButton.Enabled = $false
+    $form.Controls.Add($copyErrorButton)
+
     $openFolderButton = New-Object Windows.Forms.Button
     $openFolderButton.Text = '打开下载目录'
-    $openFolderButton.Location = New-Object Drawing.Point(454, 565)
+    $openFolderButton.Location = New-Object Drawing.Point(445, 610)
     $openFolderButton.Size = New-Object Drawing.Size(135, 36)
     $form.Controls.Add($openFolderButton)
 
     $downloadButton = New-Object Windows.Forms.Button
     $downloadButton.Text = '开始下载'
-    $downloadButton.Location = New-Object Drawing.Point(598, 565)
+    $downloadButton.Location = New-Object Drawing.Point(590, 610)
     $downloadButton.Size = New-Object Drawing.Size(100, 36)
     $downloadButton.BackColor = [Drawing.Color]::FromArgb(0, 120, 212)
     $downloadButton.ForeColor = [Drawing.Color]::White
@@ -1218,8 +1321,8 @@ function Show-ProtectedChatDialog {
 
     $closeButton = New-Object Windows.Forms.Button
     $closeButton.Text = '关闭'
-    $closeButton.Location = New-Object Drawing.Point(707, 565)
-    $closeButton.Size = New-Object Drawing.Size(48, 36)
+    $closeButton.Location = New-Object Drawing.Point(700, 610)
+    $closeButton.Size = New-Object Drawing.Size(55, 36)
     $form.Controls.Add($closeButton)
 
     $state = [pscustomobject]@{
@@ -1228,14 +1331,7 @@ function Show-ProtectedChatDialog {
         Chats        = @()
         ExportPath   = ''
         MediaCount   = 1
-    }
-
-    # GetNewClosure uses a dynamic script scope. Capture application paths as local values
-    # so button and timer events never resolve $script:* against that temporary scope.
-    $runtimeDirectory = [string]$script:RuntimeDir
-    $downloadDirectory = [string]$script:Settings.DownloadDirectory
-    if ([string]::IsNullOrWhiteSpace($downloadDirectory)) {
-        $downloadDirectory = [string]$script:DownloadsDefault
+        LastError    = ''
     }
 
     $setBusy = {
@@ -1244,6 +1340,7 @@ function Show-ProtectedChatDialog {
         $searchBox.Enabled = -not $Busy
         $chatList.Enabled = -not $Busy
         $countBox.Enabled = -not $Busy
+        $changeFolderButton.Enabled = -not $Busy
         $downloadButton.Enabled = (-not $Busy -and $chatList.SelectedItems.Count -gt 0)
         $closeButton.Text = if ($Busy) { '停止' } else { '关闭' }
         if (-not [string]::IsNullOrWhiteSpace($Message)) { $status.Text = $Message }
@@ -1257,16 +1354,39 @@ function Show-ProtectedChatDialog {
         $state.ExportPath = ''
     }.GetNewClosure()
 
+    $clearError = {
+        $state.LastError = ''
+        $copyErrorButton.Enabled = $false
+    }.GetNewClosure()
+
     $finishError = {
         param([string]$Message)
+        $failedPhase = [string]$state.Phase
+        $phaseLabel = switch ($failedPhase) {
+            'list'     { '读取聊天列表失败' }
+            'prepare'  { '下载前检查失败' }
+            'export'   { '查找最近媒体失败' }
+            'download' { '下载媒体失败' }
+            default    { '操作失败' }
+        }
         & $removeExport
         $state.Phase = 'idle'
         $progress.Style = 'Blocks'
         $progress.Value = 0
-        $status.Text = $Message
+        if ($Message -eq '操作已停止。') {
+            & $clearError
+            $status.Text = $Message
+            $status.ForeColor = [Drawing.Color]::DimGray
+            & $setBusy $false ''
+            Append-Log '无链接下载已由用户停止。'
+            return
+        }
+        $status.Text = "$phaseLabel：$Message"
         $status.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+        $state.LastError = "tdl Chinese GUI v$appVersion`r`n功能：机器人 / 无链接下载`r`n阶段：$phaseLabel`r`n错误：$Message"
+        $copyErrorButton.Enabled = $true
         & $setBusy $false ''
-        Append-Log "无链接下载失败：$Message"
+        Append-Log "无链接下载失败：$phaseLabel：$Message"
     }.GetNewClosure()
 
     $renderChats = {
@@ -1308,12 +1428,13 @@ function Show-ProtectedChatDialog {
 
     $startChatList = {
         if ($null -ne $state.Run) { return }
+        $state.Phase = 'list'
+        & $clearError
         try {
             $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
             $progress.Style = 'Marquee'
             $progress.MarqueeAnimationSpeed = 24
             & $setBusy $true '正在读取当前 Telegram 账号的聊天列表，请稍候……'
-            $state.Phase = 'list'
             $state.Run = Start-HiddenProcessCapture (Get-ChatListArguments) 'protected-list'
         }
         catch {
@@ -1340,9 +1461,12 @@ function Show-ProtectedChatDialog {
         )
         if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
 
+        $state.Phase = 'prepare'
+        & $clearError
         try {
-            Ensure-Directory $runtimeDirectory
-            $state.ExportPath = Join-Path $runtimeDirectory ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
+            Assert-DirectoryWritable $pathContext.DownloadDirectory
+            Ensure-Directory $pathContext.RuntimeDirectory
+            $state.ExportPath = Join-Path $pathContext.RuntimeDirectory ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
             $state.MediaCount = $count
             $state.Phase = 'export'
             $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
@@ -1414,17 +1538,23 @@ function Show-ProtectedChatDialog {
         }
 
         if ($phase -eq 'export') {
-            if ($exitCode -ne 0 -or -not (Test-Path -LiteralPath $state.ExportPath)) {
+            $exportReady = (-not [string]::IsNullOrWhiteSpace([string]$state.ExportPath) -and
+                (Test-Path -LiteralPath $state.ExportPath))
+            if ($exitCode -ne 0) {
                 & $finishError (Get-FriendlyTdlError $allText $exitCode)
                 return
             }
+            if (-not $exportReady) {
+                & $finishError '没有生成媒体索引，聊天中可能没有可下载的图片、视频或文件。'
+                return
+            }
             try {
-                Ensure-Directory $downloadDirectory
+                Ensure-Directory $pathContext.DownloadDirectory
                 $state.Phase = 'download'
                 $status.Text = '已找到媒体，正在开始下载……'
                 $progress.Style = 'Marquee'
                 $progress.MarqueeAnimationSpeed = 24
-                $state.Run = Start-HiddenProcessCapture (Get-ExportDownloadArguments $state.ExportPath) 'protected-download'
+                $state.Run = Start-HiddenProcessCapture (Get-ExportDownloadArguments $state.ExportPath $pathContext.DownloadDirectory) 'protected-download'
             }
             catch {
                 $state.Run = $null
@@ -1445,9 +1575,11 @@ function Show-ProtectedChatDialog {
             $progress.Value = 100
             $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
             $status.Text = "下载完成：已处理最近 $($state.MediaCount) 个媒体。"
+            & $clearError
             & $setBusy $false ''
-            Append-Log "机器人 / 受保护聊天下载完成，已处理最近 $($state.MediaCount) 个媒体。"
-            [System.Media.SystemSounds]::Asterisk.Play()
+            $completionMessage = "机器人 / 受保护聊天下载完成，已处理最近 $($state.MediaCount) 个媒体。"
+            Append-Log $completionMessage
+            Show-CompletionNotification $completionMessage
         }
     }.GetNewClosure())
 
@@ -1465,10 +1597,46 @@ function Show-ProtectedChatDialog {
         }
     }.GetNewClosure())
 
+    $changeFolderButton.Add_Click({
+        $picker = New-Object Windows.Forms.FolderBrowserDialog
+        try {
+            $picker.Description = '选择机器人媒体保存位置'
+            $picker.SelectedPath = [string]$pathContext.DownloadDirectory
+            if ($picker.ShowDialog($form) -eq [Windows.Forms.DialogResult]::OK) {
+                Assert-DirectoryWritable $picker.SelectedPath
+                $pathContext.DownloadDirectory = $picker.SelectedPath
+                Set-DownloadDirectorySetting $picker.SelectedPath
+                $destinationLabel.Text = '保存到：' + $picker.SelectedPath
+                & $clearError
+                $status.Text = '保存目录已更新。'
+                $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+            }
+        }
+        catch {
+            [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法使用该目录', 'OK', 'Error')
+        }
+        finally {
+            $picker.Dispose()
+        }
+    }.GetNewClosure())
+
+    $copyErrorButton.Add_Click({
+        if ([string]::IsNullOrWhiteSpace([string]$state.LastError)) { return }
+        try {
+            [Windows.Forms.Clipboard]::SetText([string]$state.LastError)
+            $status.Text = '错误信息已复制，可以直接粘贴给开发者。'
+            $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+        }
+        catch {
+            $status.Text = '复制失败，请直接截取当前窗口。'
+            $status.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+        }
+    }.GetNewClosure())
+
     $openFolderButton.Add_Click({
         try {
-            Ensure-Directory $downloadDirectory
-            [void][Diagnostics.Process]::Start('explorer.exe', (ConvertTo-NativeArgument $downloadDirectory))
+            Ensure-Directory $pathContext.DownloadDirectory
+            [void][Diagnostics.Process]::Start('explorer.exe', (ConvertTo-NativeArgument $pathContext.DownloadDirectory))
         }
         catch {
             [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法打开目录', 'OK', 'Error')
@@ -1885,20 +2053,35 @@ if ($SelfTest) {
     if ($chatExportTest -notcontains 'export' -or $chatExportTest -notcontains 'last' -or $chatExportTest -notcontains '123') {
         throw 'SELFTEST: protected chat export arguments are incomplete'
     }
-    $fileDownloadTest = Get-ExportDownloadArguments 'D:\temp\protected.json'
-    if ($fileDownloadTest -notcontains '-f' -or $fileDownloadTest -notcontains 'D:\temp\protected.json') {
+    $customDownloadDirectoryTest = 'D:\temp\custom downloads'
+    $fileDownloadTest = Get-ExportDownloadArguments 'D:\temp\protected.json' $customDownloadDirectoryTest
+    if ($fileDownloadTest -notcontains '-f' -or
+        $fileDownloadTest -notcontains 'D:\temp\protected.json' -or
+        $fileDownloadTest -notcontains $customDownloadDirectoryTest) {
         throw 'SELFTEST: exported file download arguments are incomplete'
     }
-    $capturedRuntimeDirectoryTest = [string]$script:RuntimeDir
-    $capturedDownloadDirectoryTest = [string]$script:Settings.DownloadDirectory
-    $protectedPathClosureTest = {
-        return @($capturedRuntimeDirectoryTest, $capturedDownloadDirectoryTest)
-    }.GetNewClosure()
-    $protectedPathValues = @(& $protectedPathClosureTest)
-    if ($protectedPathValues.Count -ne 2 -or
-        [string]::IsNullOrWhiteSpace([string]$protectedPathValues[0]) -or
-        [string]::IsNullOrWhiteSpace([string]$protectedPathValues[1])) {
+    Assert-DirectoryWritable $script:RuntimeDir
+    $protectedPathContextTest = [pscustomobject]@{
+        RuntimeDirectory  = [string]$script:RuntimeDir
+        DownloadDirectory = [string]$script:Settings.DownloadDirectory
+    }
+    $protectedPathClosureTest = { return $protectedPathContextTest }.GetNewClosure()
+    $protectedPathValues = & $protectedPathClosureTest
+    if ([string]::IsNullOrWhiteSpace([string]$protectedPathValues.RuntimeDirectory) -or
+        [string]::IsNullOrWhiteSpace([string]$protectedPathValues.DownloadDirectory)) {
         throw 'SELFTEST: protected dialog paths were lost inside closure'
+    }
+    if ((Get-FriendlyTdlError 'no downloadable messages' 1) -notmatch '没有找到') {
+        throw 'SELFTEST: no-media error was not translated'
+    }
+    $redactedErrorTest = Get-FriendlyTdlError ('failure in ' + $script:AppDir) 1
+    if ($redactedErrorTest -match [regex]::Escape($script:AppDir)) {
+        throw 'SELFTEST: local path was not removed from diagnostic text'
+    }
+    if ([int]$script:Settings.Threads -lt 1 -or [int]$script:Settings.Threads -gt 16 -or
+        [int]$script:Settings.Limit -lt 1 -or [int]$script:Settings.Limit -gt 8 -or
+        [int]$script:Settings.RetryCount -lt 0 -or [int]$script:Settings.RetryCount -gt 5) {
+        throw 'SELFTEST: settings were not normalized'
     }
     Write-Output 'SELFTEST_OK'
     Write-Output ($testOutput.Trim())

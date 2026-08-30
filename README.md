@@ -6,7 +6,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell)
-![GUI](https://img.shields.io/badge/GUI-v1.2.2-16A085)
+![GUI](https://img.shields.io/badge/GUI-v1.3.0-16A085)
 ![tdl](https://img.shields.io/badge/tdl-v0.20.4-2CA5E0)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
@@ -38,6 +38,8 @@ tdl 功能强大，但原版主要通过命令行使用。本项目为它增加�
 - 显示当前账号名称、账号 ID 和连接状态
 - 可粘贴一整段文字，自动识别其中的 Telegram 消息链接
 - 新增机器人 / 受保护聊天下载：无需消息链接，自动读取聊天列表并下载最近媒体
+- 无链接下载可查看和更改保存目录，开始前自动检查目录是否可写
+- 失败时显示具体处理阶段，并可一键复制经过整理的错误信息
 - 多链接队列连续下载，下载完成后窗口不会退出
 - 队列支持统计、重试、删除和打开 Telegram 原消息
 - 失败原因尽量转换成易懂的中文，并按设置自动重试
@@ -77,8 +79,9 @@ powershell -ExecutionPolicy Bypass -File .\一键安装或更新.ps1 -Proxy 'htt
 3. 有消息链接时：粘贴单条、多条或包含链接的文字，点击 **加入链接队列**。
 4. 机器人或受保护聊天没有链接时：点击 **机器人 / 无链接下载**。
 5. 在新窗口中选择机器人；机器人会自动排在列表最前。
-6. 默认下载最近 1 个媒体，也可改成最近 5/10 个；普通文字消息会被自动忽略。
-7. 下载期间不要同时运行另一个 tdl 实例，以免登录数据被占用。
+6. 检查窗口中的保存位置；需要时可点 **更改保存目录**。
+7. 默认下载最近 1 个媒体，也可改成最近 5/10 个；普通文字消息会被自动忽略。
+8. 如果失败，可点 **复制错误信息** 后直接粘贴到 Issue；下载期间不要同时运行另一个 tdl 实例。
 
 默认下载位置是项目目录下的 **downloads** 文件夹。代理默认关闭；如有需要，请在 **设置** 中启用并填写你的实际代理地址。
 
