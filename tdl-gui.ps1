@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.1'
+$script:AppVersion = '1.3.2'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -1866,17 +1866,29 @@ function Show-SettingsDialog {
 function Get-LatestQrBlock {
     param([string]$Text)
     $clean = Remove-AnsiCodes $Text
+    # QR codes may be refreshed more than once. Keep complete contiguous blocks separate.
     # Do not use $matches here: PowerShell treats it as the automatic $Matches variable.
-    $qrLines = New-Object System.Collections.Generic.List[string]
+    $latestQrLines = @()
+    $currentQrLines = New-Object System.Collections.Generic.List[string]
+    $minimumQrLines = 8
     foreach ($line in ($clean -split "`n")) {
         $candidate = $line.TrimEnd("`r")
-        if ($candidate.Length -ge 25 -and $candidate -match '^[█▄▀ ]+$') {
-            [void]$qrLines.Add($candidate)
+        if ($candidate.Length -ge 25 -and
+            $candidate -match '^[█▄▀ ]+$' -and
+            $candidate -match '[█▄▀]') {
+            [void]$currentQrLines.Add($candidate)
+            continue
         }
+        if ($currentQrLines.Count -ge $minimumQrLines -and $currentQrLines.Count -ge $latestQrLines.Count) {
+            $latestQrLines = @($currentQrLines.ToArray())
+        }
+        $currentQrLines.Clear()
     }
-    if ($qrLines.Count -eq 0) { return '' }
-    $take = [Math]::Min(24, $qrLines.Count)
-    return (($qrLines | Select-Object -Last $take) -join "`r`n")
+    if ($currentQrLines.Count -ge $minimumQrLines -and $currentQrLines.Count -ge $latestQrLines.Count) {
+        $latestQrLines = @($currentQrLines.ToArray())
+    }
+    if ($latestQrLines.Count -eq 0) { return '' }
+    return ($latestQrLines -join "`r`n")
 }
 
 function Show-LoginDialog {
@@ -1929,8 +1941,9 @@ function Show-LoginDialog {
     $qrBox.ReadOnly = $true
     $qrBox.WordWrap = $false
     $qrBox.ScrollBars = 'Both'
-    $qrBox.BackColor = [Drawing.Color]::White
-    $qrBox.ForeColor = [Drawing.Color]::Black
+    # tdl renders terminal QR codes for a dark console: spaces are dark modules and blocks are light modules.
+    $qrBox.BackColor = [Drawing.Color]::Black
+    $qrBox.ForeColor = [Drawing.Color]::White
     $qrBox.Font = New-Object Drawing.Font('Consolas', 9, [Drawing.FontStyle]::Regular)
     $qrBox.Location = New-Object Drawing.Point(22, 96)
     $qrBox.Size = New-Object Drawing.Size(575, 465)
@@ -2046,9 +2059,16 @@ if ($SelfTest) {
     if ($loginArgumentTest -notcontains 'login' -or $loginArgumentTest -notcontains 'qr') {
         throw 'SELFTEST: login arguments are incomplete'
     }
-    $qrLineTest = '█' * 25
-    if ((Get-LatestQrBlock ("noise`r`n" + $qrLineTest + "`r`n")) -ne $qrLineTest) {
-        throw 'SELFTEST: QR-code output parsing failed'
+    $oldQrLineTest = '█' * 25
+    $newQrLineTest = '▄' * 25
+    $partialQrLineTest = '▀' * 25
+    $qrSeparatorLineTest = ' ' * 25
+    $oldQrBlockTest = ((1..12 | ForEach-Object { $oldQrLineTest }) -join "`r`n")
+    $newQrBlockTest = ((1..14 | ForEach-Object { $newQrLineTest }) -join "`r`n")
+    $partialQrBlockTest = ((1..4 | ForEach-Object { $partialQrLineTest }) -join "`r`n")
+    $parsedQrBlockTest = Get-LatestQrBlock ("noise`r`n$oldQrBlockTest`r`n$qrSeparatorLineTest`r`n$newQrBlockTest`r`n$qrSeparatorLineTest`r`n$partialQrBlockTest")
+    if ($parsedQrBlockTest -ne $newQrBlockTest -or ($parsedQrBlockTest -split "`r`n").Count -ne 14) {
+        throw 'SELFTEST: latest complete QR-code block was not selected'
     }
     $downloadArgumentTest = Get-DownloadArguments 'https://t.me/c/1000000000/1'
     if ($downloadArgumentTest -notcontains 'dl' -or $downloadArgumentTest -notcontains 'https://t.me/c/1000000000/1') {
