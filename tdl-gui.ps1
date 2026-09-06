@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.3'
+$script:AppVersion = '1.3.4'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -217,6 +217,12 @@ function Join-NativeArguments {
     return (($Arguments | ForEach-Object { ConvertTo-NativeArgument ([string]$_) }) -join ' ')
 }
 
+function Get-CaptureBufferSize {
+    param([string]$Kind)
+    if ($Kind -eq 'login') { return 1 }
+    return 4096
+}
+
 function Start-HiddenProcessCapture {
     param(
         [string[]]$Arguments,
@@ -230,6 +236,7 @@ function Start-HiddenProcessCapture {
     $runId = [Guid]::NewGuid().ToString('N')
     $stdoutPath = Join-Path $script:RuntimeDir "$runId.out.log"
     $stderrPath = Join-Path $script:RuntimeDir "$runId.err.log"
+    $captureBufferSize = Get-CaptureBufferSize $Kind
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $script:TdlPath
@@ -252,13 +259,15 @@ function Start-HiddenProcessCapture {
         $stdoutPath,
         [System.IO.FileMode]::Create,
         [System.IO.FileAccess]::Write,
-        [System.IO.FileShare]::ReadWrite
+        [System.IO.FileShare]::ReadWrite,
+        $captureBufferSize
     )
     $stderrStream = New-Object System.IO.FileStream(
         $stderrPath,
         [System.IO.FileMode]::Create,
         [System.IO.FileAccess]::Write,
-        [System.IO.FileShare]::ReadWrite
+        [System.IO.FileShare]::ReadWrite,
+        $captureBufferSize
     )
 
     $stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync($stdoutStream)
@@ -535,6 +544,9 @@ function Get-FriendlyTdlError {
     }
     if ($clean -match '(?i)(flood.?wait|too many requests|rate limit)') {
         return 'Telegram 请求过于频繁，请稍等一段时间后重试。'
+    }
+    if ($clean -match '(?i)AUTH_TOKEN_EXPIRED') {
+        return '登录二维码已过期，请点击“刷新二维码”后立即扫描。'
     }
     if ($clean -match '(?i)(auth.?key|session.*revoked|unauthorized|not authorized)') {
         return 'Telegram 登录已失效，请点击右上角重新登录。'
@@ -1898,7 +1910,8 @@ function Show-LoginDialog {
     if ($null -ne $script:ActiveRun -and -not $script:ActiveRun.Process.HasExited) {
         [void][Windows.Forms.MessageBox]::Show($script:MainForm, '请先停止当前下载任务，再进行登录或更换账号。', 'Telegram 登录', 'OK', 'Information')
         return
-    }    if ($null -ne $script:LoginRun -and -not $script:LoginRun.Process.HasExited) {
+    }
+    if ($null -ne $script:LoginRun -and -not $script:LoginRun.Process.HasExited) {
         [void][Windows.Forms.MessageBox]::Show($script:MainForm, '登录窗口已经在运行。', 'Telegram 登录', 'OK', 'Information')
         return
     }
@@ -1957,6 +1970,13 @@ function Show-LoginDialog {
     $state.Anchor = 'Bottom,Left'
     $form.Controls.Add($state)
 
+    $refreshQrButton = New-Object Windows.Forms.Button
+    $refreshQrButton.Text = '刷新二维码'
+    $refreshQrButton.Location = New-Object Drawing.Point(385, 574)
+    $refreshQrButton.Size = New-Object Drawing.Size(105, 34)
+    $refreshQrButton.Anchor = 'Bottom,Right'
+    $form.Controls.Add($refreshQrButton)
+
     $closeButton = New-Object Windows.Forms.Button
     $closeButton.Text = '取消'
     $closeButton.Location = New-Object Drawing.Point(500, 574)
@@ -1964,9 +1984,39 @@ function Show-LoginDialog {
     $closeButton.Anchor = 'Bottom,Right'
     $form.Controls.Add($closeButton)
 
+    $loginUiState = [pscustomobject]@{
+        LastQrText = ''
+        Generation = 0
+    }
+    $startLogin = {
+        if ($null -ne $script:LoginRun) {
+            if (-not $script:LoginRun.Process.HasExited) {
+                Stop-CapturedRun $script:LoginRun
+                try { [void]$script:LoginRun.Process.WaitForExit(3000) } catch {}
+            }
+            Complete-CapturedRun $script:LoginRun
+            try { $script:LoginRun.Process.Dispose() } catch {}
+            Remove-CapturedRunFiles $script:LoginRun
+            $script:LoginRun = $null
+        }
+        $loginUiState.LastQrText = ''
+        $loginUiState.Generation = 0
+        $qrBox.Text = '正在获取新的登录二维码，请稍候……'
+        $state.Text = '正在生成新的二维码'
+        $state.ForeColor = [Drawing.Color]::DimGray
+        $closeButton.Text = '取消'
+        $refreshQrButton.Enabled = $false
+        try {
+            $loginArguments = Get-LoginArguments
+            $script:LoginRun = Start-HiddenProcessCapture $loginArguments 'login'
+        }
+        finally {
+            $refreshQrButton.Enabled = $true
+        }
+    }
+
     try {
-        $loginArguments = Get-LoginArguments
-        $script:LoginRun = Start-HiddenProcessCapture $loginArguments 'login'
+        & $startLogin
     }
     catch {
         [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法登录', 'OK', 'Error')
@@ -1981,11 +2031,19 @@ function Show-LoginDialog {
         if ($null -eq $script:LoginRun) { return }
         $text = Get-RunText $script:LoginRun
         $qr = Get-LatestQrBlock $text
-        if (-not [string]::IsNullOrWhiteSpace($qr)) {
+        if (-not [string]::IsNullOrWhiteSpace($qr) -and $qr -ne $loginUiState.LastQrText) {
+            $loginUiState.LastQrText = $qr
+            $loginUiState.Generation++
             $qrBox.Text = $qr
             $qrBox.SelectionStart = 0
             $qrBox.ScrollToCaret()
-            $state.Text = '二维码已生成，等待手机确认'
+            $state.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+            $state.Text = if ($loginUiState.Generation -eq 1) {
+                '新二维码已生成，请立即扫描'
+            }
+            else {
+                "二维码已自动刷新（第 $($loginUiState.Generation) 张），请扫描当前这一张"
+            }
         }
         if ($script:LoginRun.Process.HasExited) {
             $loginTimer.Stop()
@@ -1995,6 +2053,7 @@ function Show-LoginDialog {
             if (-not $script:LoginRun.StopRequested -and $exitCode -eq 0) {
                 $state.Text = '登录成功，可以关闭此窗口'
                 $state.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+                $refreshQrButton.Enabled = $false
                 $closeButton.Text = '完成'
                 Append-Log 'Telegram 登录成功。'
                 $script:AccountName = ''
@@ -2006,10 +2065,11 @@ function Show-LoginDialog {
                 Update-LoginIndicator
             }
             elseif (-not $script:LoginRun.StopRequested) {
-                $state.Text = '登录未完成，请检查代理后重试'
+                $friendlyLoginError = Get-FriendlyTdlError $clean $exitCode
+                $state.Text = $friendlyLoginError
                 $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
-                $details = @(($clean -split "`n") | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Last 4)
-                if ($details.Count -gt 0) { $qrBox.Text = $details -join "`r`n" }
+                $qrBox.Text = $friendlyLoginError + "`r`n`r`n" + '请点击“刷新二维码”后重试。'
+                $refreshQrButton.Enabled = $true
             }
             try { $script:LoginRun.Process.Dispose() } catch {}
             Remove-CapturedRunFiles $script:LoginRun
@@ -2018,6 +2078,17 @@ function Show-LoginDialog {
         }
     })
 
+    $refreshQrButton.Add_Click({
+        try {
+            & $startLogin
+            $loginTimer.Start()
+        }
+        catch {
+            $state.Text = Get-FriendlyTdlError $_.Exception.Message -1
+            $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+            $refreshQrButton.Enabled = $true
+        }
+    })
     $closeButton.Add_Click({ $form.Close() })
     $form.Add_FormClosing({
         $loginTimer.Stop()
@@ -2053,6 +2124,9 @@ if ($SelfTest) {
     $commonArgumentTest = Get-CommonArguments
     if ($commonArgumentTest -isnot [System.Collections.Generic.List[string]]) {
         throw 'SELFTEST: common arguments are not mutable'
+    }
+    if ((Get-CaptureBufferSize 'login') -ne 1 -or (Get-CaptureBufferSize 'download') -lt 4096) {
+        throw 'SELFTEST: login capture is not configured for immediate output'
     }
     $loginArgumentTest = Get-LoginArguments
     if ($loginArgumentTest -notcontains 'login' -or $loginArgumentTest -notcontains 'qr') {
@@ -2107,6 +2181,9 @@ if ($SelfTest) {
     }
     if ((Get-FriendlyTdlError 'no downloadable messages' 1) -notmatch '没有找到') {
         throw 'SELFTEST: no-media error was not translated'
+    }
+    if ((Get-FriendlyTdlError 'AUTH_TOKEN_EXPIRED' 1) -notmatch '二维码已过期') {
+        throw 'SELFTEST: expired QR token error was not translated'
     }
     $redactedErrorTest = Get-FriendlyTdlError ('failure in ' + $script:AppDir) 1
     if ($redactedErrorTest -match [regex]::Escape($script:AppDir)) {
