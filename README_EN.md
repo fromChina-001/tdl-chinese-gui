@@ -18,13 +18,13 @@ Telegram login, message resolution, and file transfer are provided by **[iyear/t
 
 This repository contains the independent GUI and installer only. The installer downloads tdl.exe from the official upstream GitHub Release and verifies its SHA-256 checksum. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Highlights in v1.3.5
+## Highlights in v1.3.6
 
 - Chinese Windows GUI with no visible console
 - First-run guide and missing-core recovery
 - Telegram QR-code login and account status
 - Immediate QR output, live QR rotation, and a manual refresh button
-- In-window Telegram 2FA password entry after QR scanning; the password is never saved
+- In-window Telegram 2FA password entry through a Windows-compatible hidden-console bridge; the password is never saved
 - Extracts multiple Telegram message URLs from pasted text
 - Downloads recent media from bots and protected chats without requiring a message URL
 - Handles chats that do not expose a public username
