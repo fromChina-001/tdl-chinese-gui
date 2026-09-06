@@ -6,7 +6,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell)
-![GUI](https://img.shields.io/badge/GUI-v1.3.4-16A085)
+![GUI](https://img.shields.io/badge/GUI-v1.3.5-16A085)
 ![tdl](https://img.shields.io/badge/tdl-v0.20.4-2CA5E0)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
@@ -37,6 +37,7 @@ tdl 功能强大，但原版主要通过命令行使用。本项目为它增加�
 - 在窗口内完成 Telegram 二维码登录
 - 显示当前账号名称、账号 ID 和连接状态
 - 登录二维码即时显示和自动换新，并可手动点击“刷新二维码”
+- 扫码后自动显示 Telegram 两步验证密码框，支持回车提交且不保存密码
 - 可粘贴一整段文字，自动识别其中的 Telegram 消息链接
 - 新增机器人 / 受保护聊天下载：无需消息链接，自动读取聊天列表并下载最近媒体
 - 无链接下载可查看和更改保存目录，开始前自动检查目录是否可写
@@ -76,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File .\一键安装或更新.ps1 -Proxy 'htt
 ## 使用方法
 
 1. 点击右上角 **登录 / 更换账号**。
-2. 在手机 Telegram 中进入 **设置 → 设备 → 链接桌面设备**，扫描窗口中的二维码。
+2. 在手机 Telegram 中进入 **设置 → 设备 → 链接桌面设备**，扫描窗口中的二维码；如果账号开启了两步验证，按提示输入云端密码并提交。
 3. 有消息链接时：粘贴单条、多条或包含链接的文字，点击 **加入链接队列**。
 4. 机器人或受保护聊天没有链接时：点击 **机器人 / 无链接下载**。
 5. 在新窗口中选择机器人；机器人会自动排在列表最前。
@@ -100,6 +101,7 @@ powershell -ExecutionPolicy Bypass -File .\一键安装或更新.ps1 -Proxy 'htt
 - 本地代理与下载设置
 - 下载的图片、视频和文件
 - 临时运行日志及 tdl.exe
+- Telegram 两步验证密码（仅直接提交给本机 tdl 进程，提交后清空）
 
 tdl 的登录会话默认保存在当前 Windows 用户目录的 **.tdl** 文件夹中。本项目不会要求用户上传会话文件。界面会隐藏完整消息链接，但提交截图或 Issue 前仍应自行检查敏感信息。
 

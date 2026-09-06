@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.4'
+$script:AppVersion = '1.3.5'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -244,6 +244,10 @@ function Start-HiddenProcessCapture {
     $startInfo.WorkingDirectory = $script:AppDir
     $startInfo.UseShellExecute = $false
     $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    if ($null -ne $startInfo.PSObject.Properties['StandardInputEncoding']) {
+        $startInfo.StandardInputEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
@@ -254,6 +258,7 @@ function Start-HiddenProcessCapture {
     if (-not $process.Start()) {
         throw '无法启动 tdl。'
     }
+    $process.StandardInput.AutoFlush = $true
 
     $stdoutStream = New-Object System.IO.FileStream(
         $stdoutPath,
@@ -276,6 +281,7 @@ function Start-HiddenProcessCapture {
     return [pscustomobject]@{
         Kind          = $Kind
         Process       = $process
+        StandardInput = $process.StandardInput
         StdoutPath    = $stdoutPath
         StderrPath    = $stderrPath
         StdoutStream  = $stdoutStream
@@ -285,6 +291,20 @@ function Start-HiddenProcessCapture {
         LastText      = ''
         StopRequested = $false
     }
+}
+
+function Write-CapturedRunInputLine {
+    param(
+        $Run,
+        [string]$Text
+    )
+    if ($null -eq $Run -or $null -eq $Run.StandardInput) {
+        throw '登录输入通道不可用。'
+    }
+    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Text + "`r`n")
+    $stream = $Run.StandardInput.BaseStream
+    $stream.Write($bytes, 0, $bytes.Length)
+    $stream.Flush()
 }
 
 function Read-SharedUtf8File {
@@ -333,6 +353,7 @@ function Remove-AnsiCodes {
 function Complete-CapturedRun {
     param($Run)
     if ($null -eq $Run) { return }
+    try { $Run.StandardInput.Dispose() } catch {}
     try { [void]$Run.StdoutTask.Wait(1500) } catch {}
     try { [void]$Run.StderrTask.Wait(1500) } catch {}
     try { $Run.StdoutStream.Dispose() } catch {}
@@ -532,6 +553,13 @@ function Get-TelegramMessageUrls {
     return $urls.ToArray()
 }
 
+function Get-TdlTwoFactorPromptCount {
+    param([string]$Text)
+    if ([string]::IsNullOrEmpty($Text)) { return 0 }
+    $clean = Remove-AnsiCodes $Text
+    return [regex]::Matches($clean, '(?i)Enter\s+(?:Telegram\s+)?2FA\s+Password').Count
+}
+
 function Get-FriendlyTdlError {
     param([string]$Text, [int]$ExitCode)
 
@@ -547,6 +575,9 @@ function Get-FriendlyTdlError {
     }
     if ($clean -match '(?i)AUTH_TOKEN_EXPIRED') {
         return '登录二维码已过期，请点击“刷新二维码”后立即扫描。'
+    }
+    if ($clean -match '(?i)(PASSWORD_HASH_INVALID|2FA.*(?:invalid|incorrect)|invalid.*2FA|password.*(?:invalid|incorrect|wrong))') {
+        return 'Telegram 两步验证密码不正确，请刷新二维码后重新登录。'
     }
     if ($clean -match '(?i)(auth.?key|session.*revoked|unauthorized|not authorized)') {
         return 'Telegram 登录已失效，请点击右上角重新登录。'
@@ -1958,10 +1989,44 @@ function Show-LoginDialog {
     $qrBox.ForeColor = [Drawing.Color]::White
     $qrBox.Font = New-Object Drawing.Font('Consolas', 9, [Drawing.FontStyle]::Regular)
     $qrBox.Location = New-Object Drawing.Point(22, 96)
-    $qrBox.Size = New-Object Drawing.Size(575, 465)
+    $qrBox.Size = New-Object Drawing.Size(575, 405)
     $qrBox.Anchor = 'Top,Bottom,Left,Right'
     $qrBox.Text = "正在连接 Telegram，请稍候……"
     $form.Controls.Add($qrBox)
+
+    $passwordPanel = New-Object Windows.Forms.Panel
+    $passwordPanel.Location = New-Object Drawing.Point(22, 510)
+    $passwordPanel.Size = New-Object Drawing.Size(575, 52)
+    $passwordPanel.Anchor = 'Bottom,Left,Right'
+    $passwordPanel.Visible = $false
+    $form.Controls.Add($passwordPanel)
+
+    $passwordLabel = New-Object Windows.Forms.Label
+    $passwordLabel.Text = 'Telegram 两步验证密码'
+    $passwordLabel.Location = New-Object Drawing.Point(0, 5)
+    $passwordLabel.Size = New-Object Drawing.Size(160, 24)
+    $passwordPanel.Controls.Add($passwordLabel)
+
+    $passwordBox = New-Object Windows.Forms.TextBox
+    $passwordBox.Location = New-Object Drawing.Point(165, 1)
+    $passwordBox.Size = New-Object Drawing.Size(278, 28)
+    $passwordBox.Anchor = 'Top,Left,Right'
+    $passwordBox.UseSystemPasswordChar = $true
+    $passwordPanel.Controls.Add($passwordBox)
+
+    $submitPasswordButton = New-Object Windows.Forms.Button
+    $submitPasswordButton.Text = '提交密码'
+    $submitPasswordButton.Location = New-Object Drawing.Point(453, 0)
+    $submitPasswordButton.Size = New-Object Drawing.Size(122, 32)
+    $submitPasswordButton.Anchor = 'Top,Right'
+    $passwordPanel.Controls.Add($submitPasswordButton)
+
+    $passwordHint = New-Object Windows.Forms.Label
+    $passwordHint.Text = '密码只发送给本机 tdl，不会保存，也不是短信验证码。'
+    $passwordHint.Location = New-Object Drawing.Point(165, 33)
+    $passwordHint.AutoSize = $true
+    $passwordHint.ForeColor = [Drawing.Color]::DimGray
+    $passwordPanel.Controls.Add($passwordHint)
 
     $state = New-Object Windows.Forms.Label
     $state.Text = '正在生成二维码'
@@ -1985,8 +2050,10 @@ function Show-LoginDialog {
     $form.Controls.Add($closeButton)
 
     $loginUiState = [pscustomobject]@{
-        LastQrText = ''
-        Generation = 0
+        LastQrText          = ''
+        Generation          = 0
+        TwoFactorPromptCount = 0
+        AwaitingTwoFactor   = $false
     }
     $startLogin = {
         if ($null -ne $script:LoginRun) {
@@ -2001,6 +2068,12 @@ function Show-LoginDialog {
         }
         $loginUiState.LastQrText = ''
         $loginUiState.Generation = 0
+        $loginUiState.TwoFactorPromptCount = 0
+        $loginUiState.AwaitingTwoFactor = $false
+        $passwordBox.Clear()
+        $passwordBox.Enabled = $true
+        $submitPasswordButton.Enabled = $true
+        $passwordPanel.Visible = $false
         $qrBox.Text = '正在获取新的登录二维码，请稍候……'
         $state.Text = '正在生成新的二维码'
         $state.ForeColor = [Drawing.Color]::DimGray
@@ -2012,6 +2085,42 @@ function Show-LoginDialog {
         }
         finally {
             $refreshQrButton.Enabled = $true
+        }
+    }
+
+    $submitPassword = {
+        if ($null -eq $script:LoginRun -or $script:LoginRun.Process.HasExited) {
+            $state.Text = '登录请求已经结束，请点击“刷新二维码”后重试。'
+            $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+            return
+        }
+        if ([string]::IsNullOrEmpty($passwordBox.Text)) {
+            $state.Text = '请输入 Telegram 两步验证密码。'
+            $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+            [void]$passwordBox.Select()
+            return
+        }
+
+        $passwordValue = [string]$passwordBox.Text
+        try {
+            Write-CapturedRunInputLine $script:LoginRun $passwordValue
+            $loginUiState.AwaitingTwoFactor = $false
+            $passwordBox.Enabled = $false
+            $submitPasswordButton.Enabled = $false
+            $state.Text = '密码已提交，正在由 Telegram 验证……'
+            $state.ForeColor = [Drawing.Color]::FromArgb(0, 102, 170)
+        }
+        catch {
+            $loginUiState.AwaitingTwoFactor = $true
+            $passwordBox.Enabled = $true
+            $submitPasswordButton.Enabled = $true
+            $state.Text = '密码提交失败，请点击“刷新二维码”后重试。'
+            $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+            [void]$passwordBox.Select()
+        }
+        finally {
+            $passwordBox.Clear()
+            $passwordValue = $null
         }
     }
 
@@ -2045,11 +2154,28 @@ function Show-LoginDialog {
                 "二维码已自动刷新（第 $($loginUiState.Generation) 张），请扫描当前这一张"
             }
         }
+
+        $twoFactorPromptCount = Get-TdlTwoFactorPromptCount $text
+        if ($twoFactorPromptCount -gt $loginUiState.TwoFactorPromptCount) {
+            $loginUiState.TwoFactorPromptCount = $twoFactorPromptCount
+            $loginUiState.AwaitingTwoFactor = $true
+            $passwordPanel.Visible = $true
+            $passwordBox.Enabled = $true
+            $submitPasswordButton.Enabled = $true
+            $state.Text = '扫码成功，请输入 Telegram 两步验证密码'
+            $state.ForeColor = [Drawing.Color]::FromArgb(0, 102, 170)
+            [void]$passwordBox.Select()
+        }
+
         if ($script:LoginRun.Process.HasExited) {
             $loginTimer.Stop()
             $exitCode = $script:LoginRun.Process.ExitCode
             $clean = Remove-AnsiCodes (Get-RunText $script:LoginRun)
             Complete-CapturedRun $script:LoginRun
+            $passwordBox.Clear()
+            $passwordBox.Enabled = $false
+            $submitPasswordButton.Enabled = $false
+            $passwordPanel.Visible = $false
             if (-not $script:LoginRun.StopRequested -and $exitCode -eq 0) {
                 $state.Text = '登录成功，可以关闭此窗口'
                 $state.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
@@ -2078,6 +2204,14 @@ function Show-LoginDialog {
         }
     })
 
+    $submitPasswordButton.Add_Click({ & $submitPassword })
+    $passwordBox.Add_KeyDown({
+        if ($_.KeyCode -eq [Windows.Forms.Keys]::Enter) {
+            $_.SuppressKeyPress = $true
+            & $submitPassword
+        }
+    })
+
     $refreshQrButton.Add_Click({
         try {
             & $startLogin
@@ -2092,6 +2226,7 @@ function Show-LoginDialog {
     $closeButton.Add_Click({ $form.Close() })
     $form.Add_FormClosing({
         $loginTimer.Stop()
+        $passwordBox.Clear()
         if ($null -ne $script:LoginRun -and -not $script:LoginRun.Process.HasExited) {
             Stop-CapturedRun $script:LoginRun
             Complete-CapturedRun $script:LoginRun
@@ -2113,6 +2248,7 @@ function Show-LoginDialog {
 if ($SelfTest) {
     if (-not (Test-Path -LiteralPath $script:TdlPath)) { throw 'SELFTEST: tdl.exe is missing' }
     $testRun = Start-HiddenProcessCapture @('version') 'selftest'
+    if ($null -eq $testRun.StandardInput) { throw 'SELFTEST: standard input is not available' }
     [void]$testRun.Process.WaitForExit(10000)
     Start-Sleep -Milliseconds 150
     $testExit = $testRun.Process.ExitCode
@@ -2184,6 +2320,24 @@ if ($SelfTest) {
     }
     if ((Get-FriendlyTdlError 'AUTH_TOKEN_EXPIRED' 1) -notmatch '二维码已过期') {
         throw 'SELFTEST: expired QR token error was not translated'
+    }
+    if ((Get-TdlTwoFactorPromptCount '? Enter 2FA Password:') -ne 1 -or (Get-TdlTwoFactorPromptCount 'Scan QR code') -ne 0) {
+        throw 'SELFTEST: 2FA password prompt detection failed'
+    }
+    $inputMemoryTest = New-Object System.IO.MemoryStream
+    $inputWriterTest = New-Object System.IO.StreamWriter($inputMemoryTest)
+    try {
+        $inputRunTest = [pscustomobject]@{ StandardInput = $inputWriterTest }
+        Write-CapturedRunInputLine $inputRunTest '密码A1'
+        $inputTextTest = (New-Object System.Text.UTF8Encoding($false)).GetString($inputMemoryTest.ToArray())
+        if ($inputTextTest -ne "密码A1`r`n") { throw 'SELFTEST: 2FA password input was not written as UTF-8' }
+    }
+    finally {
+        $inputWriterTest.Dispose()
+        $inputMemoryTest.Dispose()
+    }
+    if ((Get-FriendlyTdlError 'PASSWORD_HASH_INVALID' 1) -notmatch '两步验证密码不正确') {
+        throw 'SELFTEST: invalid 2FA password error was not translated'
     }
     $redactedErrorTest = Get-FriendlyTdlError ('failure in ' + $script:AppDir) 1
     if ($redactedErrorTest -match [regex]::Escape($script:AppDir)) {
