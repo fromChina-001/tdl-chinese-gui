@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.0'
+$script:AppVersion = '1.3.1'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -369,6 +369,14 @@ function Get-CommonArguments {
     }
     $arguments.Add('--disable-progress-ps')
     return ,$arguments
+}
+
+function Get-LoginArguments {
+    $arguments = Get-CommonArguments
+    foreach ($argument in @('login', '-T', 'qr')) {
+        [void]$arguments.Add([string]$argument)
+    }
+    return $arguments.ToArray()
 }
 
 function Get-DownloadArguments {
@@ -1488,9 +1496,9 @@ function Show-ProtectedChatDialog {
 
         if ($state.Phase -eq 'download') {
             $downloadText = Remove-AnsiCodes (Get-RunText $state.Run)
-            $matches = [regex]::Matches($downloadText, '(?<p>\d{1,3}(?:\.\d+)?)%')
-            if ($matches.Count -gt 0) {
-                $value = [Math]::Min(100, [Math]::Max(0, [int][double]$matches[$matches.Count - 1].Groups['p'].Value))
+            $progressMatches = [regex]::Matches($downloadText, '(?<p>\d{1,3}(?:\.\d+)?)%')
+            if ($progressMatches.Count -gt 0) {
+                $value = [Math]::Min(100, [Math]::Max(0, [int][double]$progressMatches[$progressMatches.Count - 1].Groups['p'].Value))
                 $progress.Style = 'Continuous'
                 $progress.Value = $value
                 $status.Text = "正在下载：$value%"
@@ -1858,16 +1866,17 @@ function Show-SettingsDialog {
 function Get-LatestQrBlock {
     param([string]$Text)
     $clean = Remove-AnsiCodes $Text
-    $matches = New-Object System.Collections.Generic.List[string]
+    # Do not use $matches here: PowerShell treats it as the automatic $Matches variable.
+    $qrLines = New-Object System.Collections.Generic.List[string]
     foreach ($line in ($clean -split "`n")) {
         $candidate = $line.TrimEnd("`r")
         if ($candidate.Length -ge 25 -and $candidate -match '^[█▄▀ ]+$') {
-            $matches.Add($candidate)
+            [void]$qrLines.Add($candidate)
         }
     }
-    if ($matches.Count -eq 0) { return '' }
-    $take = [Math]::Min(24, $matches.Count)
-    return (($matches | Select-Object -Last $take) -join "`r`n")
+    if ($qrLines.Count -eq 0) { return '' }
+    $take = [Math]::Min(24, $qrLines.Count)
+    return (($qrLines | Select-Object -Last $take) -join "`r`n")
 }
 
 function Show-LoginDialog {
@@ -1944,11 +1953,8 @@ function Show-LoginDialog {
     $form.Controls.Add($closeButton)
 
     try {
-        $args = Get-CommonArguments
-        $args.Add('login')
-        $args.Add('-T')
-        $args.Add('qr')
-        $script:LoginRun = Start-HiddenProcessCapture $args.ToArray() 'login'
+        $loginArguments = Get-LoginArguments
+        $script:LoginRun = Start-HiddenProcessCapture $loginArguments 'login'
     }
     catch {
         [void][Windows.Forms.MessageBox]::Show($form, $_.Exception.Message, '无法登录', 'OK', 'Error')
@@ -2035,6 +2041,14 @@ if ($SelfTest) {
     $commonArgumentTest = Get-CommonArguments
     if ($commonArgumentTest -isnot [System.Collections.Generic.List[string]]) {
         throw 'SELFTEST: common arguments are not mutable'
+    }
+    $loginArgumentTest = Get-LoginArguments
+    if ($loginArgumentTest -notcontains 'login' -or $loginArgumentTest -notcontains 'qr') {
+        throw 'SELFTEST: login arguments are incomplete'
+    }
+    $qrLineTest = '█' * 25
+    if ((Get-LatestQrBlock ("noise`r`n" + $qrLineTest + "`r`n")) -ne $qrLineTest) {
+        throw 'SELFTEST: QR-code output parsing failed'
     }
     $downloadArgumentTest = Get-DownloadArguments 'https://t.me/c/1000000000/1'
     if ($downloadArgumentTest -notcontains 'dl' -or $downloadArgumentTest -notcontains 'https://t.me/c/1000000000/1') {
