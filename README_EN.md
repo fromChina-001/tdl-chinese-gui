@@ -18,7 +18,7 @@ Telegram login, message resolution, and file transfer are provided by **[iyear/t
 
 This repository contains the independent GUI and installer only. The installer downloads tdl.exe from the official upstream GitHub Release and verifies its SHA-256 checksum. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
-## Highlights in v1.3.2
+## Highlights in v1.3.3
 
 - Chinese Windows GUI with no visible console
 - First-run guide and missing-core recovery

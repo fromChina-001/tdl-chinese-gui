@@ -36,7 +36,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.2'
+$script:AppVersion = '1.3.3'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -1866,29 +1866,28 @@ function Show-SettingsDialog {
 function Get-LatestQrBlock {
     param([string]$Text)
     $clean = Remove-AnsiCodes $Text
-    # QR codes may be refreshed more than once. Keep complete contiguous blocks separate.
+    # tdl prints one terminal QR row per character column pair. A width of 45 therefore
+    # produces 23 rows. Refreshed codes can be appended without a textual separator.
     # Do not use $matches here: PowerShell treats it as the automatic $Matches variable.
-    $latestQrLines = @()
-    $currentQrLines = New-Object System.Collections.Generic.List[string]
-    $minimumQrLines = 8
+    $qrRows = New-Object System.Collections.Generic.List[string]
     foreach ($line in ($clean -split "`n")) {
         $candidate = $line.TrimEnd("`r")
-        if ($candidate.Length -ge 25 -and
-            $candidate -match '^[█▄▀ ]+$' -and
-            $candidate -match '[█▄▀]') {
-            [void]$currentQrLines.Add($candidate)
-            continue
+        if ($candidate.Length -ge 25 -and $candidate -match '^[█▄▀ ]+$') {
+            [void]$qrRows.Add($candidate)
         }
-        if ($currentQrLines.Count -ge $minimumQrLines -and $currentQrLines.Count -ge $latestQrLines.Count) {
-            $latestQrLines = @($currentQrLines.ToArray())
-        }
-        $currentQrLines.Clear()
     }
-    if ($currentQrLines.Count -ge $minimumQrLines -and $currentQrLines.Count -ge $latestQrLines.Count) {
-        $latestQrLines = @($currentQrLines.ToArray())
-    }
-    if ($latestQrLines.Count -eq 0) { return '' }
-    return ($latestQrLines -join "`r`n")
+    if ($qrRows.Count -eq 0) { return '' }
+
+    $widthGroup = $qrRows | Group-Object -Property Length | Sort-Object Count -Descending | Select-Object -First 1
+    $qrWidth = [int]$widthGroup.Name
+    $rowsAtWidth = @($qrRows | Where-Object { $_.Length -eq $qrWidth })
+    $rowsPerCode = [int][Math]::Ceiling($qrWidth / 2.0)
+    $completeCodeCount = [int][Math]::Floor($rowsAtWidth.Count / [double]$rowsPerCode)
+    if ($completeCodeCount -lt 1) { return '' }
+
+    $startIndex = ($completeCodeCount - 1) * $rowsPerCode
+    $latestQrRows = @($rowsAtWidth[$startIndex..($startIndex + $rowsPerCode - 1)])
+    return ($latestQrRows -join "`r`n")
 }
 
 function Show-LoginDialog {
@@ -2059,16 +2058,17 @@ if ($SelfTest) {
     if ($loginArgumentTest -notcontains 'login' -or $loginArgumentTest -notcontains 'qr') {
         throw 'SELFTEST: login arguments are incomplete'
     }
-    $oldQrLineTest = '█' * 25
-    $newQrLineTest = '▄' * 25
-    $partialQrLineTest = '▀' * 25
-    $qrSeparatorLineTest = ' ' * 25
-    $oldQrBlockTest = ((1..12 | ForEach-Object { $oldQrLineTest }) -join "`r`n")
-    $newQrBlockTest = ((1..14 | ForEach-Object { $newQrLineTest }) -join "`r`n")
+    $qrWidthTest = 45
+    $qrRowsPerCodeTest = [int][Math]::Ceiling($qrWidthTest / 2.0)
+    $oldQrLineTest = '█' * $qrWidthTest
+    $newQrLineTest = '▄' * $qrWidthTest
+    $partialQrLineTest = '▀' * $qrWidthTest
+    $oldQrBlockTest = ((1..$qrRowsPerCodeTest | ForEach-Object { $oldQrLineTest }) -join "`r`n")
+    $newQrBlockTest = ((1..$qrRowsPerCodeTest | ForEach-Object { $newQrLineTest }) -join "`r`n")
     $partialQrBlockTest = ((1..4 | ForEach-Object { $partialQrLineTest }) -join "`r`n")
-    $parsedQrBlockTest = Get-LatestQrBlock ("noise`r`n$oldQrBlockTest`r`n$qrSeparatorLineTest`r`n$newQrBlockTest`r`n$qrSeparatorLineTest`r`n$partialQrBlockTest")
-    if ($parsedQrBlockTest -ne $newQrBlockTest -or ($parsedQrBlockTest -split "`r`n").Count -ne 14) {
-        throw 'SELFTEST: latest complete QR-code block was not selected'
+    $parsedQrBlockTest = Get-LatestQrBlock ("noise`r`n$oldQrBlockTest`r`n$newQrBlockTest`r`n$partialQrBlockTest")
+    if ($parsedQrBlockTest -ne $newQrBlockTest -or ($parsedQrBlockTest -split "`r`n").Count -ne $qrRowsPerCodeTest) {
+        throw 'SELFTEST: latest complete QR-code frame was not selected'
     }
     $downloadArgumentTest = Get-DownloadArguments 'https://t.me/c/1000000000/1'
     if ($downloadArgumentTest -notcontains 'dl' -or $downloadArgumentTest -notcontains 'https://t.me/c/1000000000/1') {
