@@ -3,6 +3,7 @@
 # License: AGPL-3.0-or-later
 param(
     [switch]$SelfTest,
+    [switch]$RequireConsoleIoSelfTest,
     [switch]$AccountSelfTest,
     [string]$RenderPreview
 )
@@ -17,12 +18,47 @@ Add-Type @"
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class TdlGuiNative
 {
     private const int STD_INPUT_HANDLE = -10;
+    private const int STD_OUTPUT_HANDLE = -11;
     private const ushort KEY_EVENT = 0x0001;
     private const ushort VK_RETURN = 0x000D;
+    private const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Coord
+    {
+        public short X;
+        public short Y;
+
+        public Coord(short x, short y)
+        {
+            X = x;
+            Y = y;
+        }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SmallRect
+    {
+        public short Left;
+        public short Top;
+        public short Right;
+        public short Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ConsoleScreenBufferInfo
+    {
+        public Coord Size;
+        public Coord CursorPosition;
+        public ushort Attributes;
+        public SmallRect Window;
+        public Coord MaximumWindowSize;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     public struct KeyEventRecord
@@ -55,6 +91,55 @@ public static class TdlGuiNative
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint mode);
 
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint mode);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetConsoleScreenBufferInfo(
+        IntPtr hConsoleOutput,
+        out ConsoleScreenBufferInfo info
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleScreenBufferSize(IntPtr hConsoleOutput, Coord size);
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FillConsoleOutputCharacter(
+        IntPtr hConsoleOutput,
+        char character,
+        uint length,
+        Coord writeCoord,
+        out uint written
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool FillConsoleOutputAttribute(
+        IntPtr hConsoleOutput,
+        ushort attribute,
+        uint length,
+        Coord writeCoord,
+        out uint written
+    );
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetConsoleCursorPosition(IntPtr hConsoleOutput, Coord cursorPosition);
+
+    [DllImport("kernel32.dll", EntryPoint = "ReadConsoleOutputCharacterW", SetLastError = true, CharSet = CharSet.Unicode)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ReadConsoleOutputCharacter(
+        IntPtr hConsoleOutput,
+        [Out] char[] buffer,
+        uint length,
+        Coord readCoord,
+        out uint read
+    );
+
     [DllImport("kernel32.dll", EntryPoint = "WriteConsoleInputW", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool WriteConsoleInput(
@@ -64,6 +149,17 @@ public static class TdlGuiNative
         out uint written
     );
 
+    private static IntPtr GetValidConsoleHandle(int kind, string label)
+    {
+        IntPtr handle = GetStdHandle(kind);
+        uint mode;
+        if (handle == IntPtr.Zero || handle == new IntPtr(-1) || !GetConsoleMode(handle, out mode))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), label + " is unavailable");
+        }
+        return handle;
+    }
+
     public static int GetConsoleInputEventCount(string text)
     {
         return (((text ?? String.Empty).Length + 1) * 2);
@@ -71,20 +167,135 @@ public static class TdlGuiNative
 
     public static bool HasConsoleInput()
     {
-        IntPtr input = GetStdHandle(STD_INPUT_HANDLE);
-        uint mode;
-        return input != IntPtr.Zero && input != new IntPtr(-1) && GetConsoleMode(input, out mode);
+        try
+        {
+            GetValidConsoleHandle(STD_INPUT_HANDLE, "Hidden console input");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static bool HasConsoleOutput()
+    {
+        try
+        {
+            GetValidConsoleHandle(STD_OUTPUT_HANDLE, "Hidden console output");
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public static void PrepareConsoleCapture(int minimumHeight)
+    {
+        IntPtr output = GetValidConsoleHandle(STD_OUTPUT_HANDLE, "Hidden console output");
+        uint outputMode;
+        if (GetConsoleMode(output, out outputMode))
+        {
+            SetConsoleMode(output, outputMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+
+        ConsoleScreenBufferInfo info;
+        if (!GetConsoleScreenBufferInfo(output, out info))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to inspect hidden console");
+        }
+
+        int requestedHeight = Math.Max(info.Size.Y, Math.Min(Math.Max(minimumHeight, 256), 8192));
+        if (requestedHeight != info.Size.Y)
+        {
+            Coord requestedSize = new Coord(info.Size.X, (short)requestedHeight);
+            if (!SetConsoleScreenBufferSize(output, requestedSize))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to resize hidden console buffer");
+            }
+            if (!GetConsoleScreenBufferInfo(output, out info))
+            {
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to refresh hidden console state");
+            }
+        }
+
+        uint cells = (uint)(info.Size.X * info.Size.Y);
+        uint written;
+        Coord origin = new Coord(0, 0);
+        if (!FillConsoleOutputCharacter(output, ' ', cells, origin, out written))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to clear hidden console text");
+        }
+        FillConsoleOutputAttribute(output, info.Attributes, cells, origin, out written);
+        if (!SetConsoleCursorPosition(output, origin))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to reset hidden console cursor");
+        }
+    }
+
+    public static string ReadConsoleBufferText()
+    {
+        IntPtr output = GetValidConsoleHandle(STD_OUTPUT_HANDLE, "Hidden console output");
+        ConsoleScreenBufferInfo info;
+        if (!GetConsoleScreenBufferInfo(output, out info))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to inspect hidden console");
+        }
+
+        int width = info.Size.X;
+        int height = info.Size.Y;
+        int total = checked(width * height);
+        char[] characters = new char[total];
+        uint read;
+        if (!ReadConsoleOutputCharacter(output, characters, (uint)total, new Coord(0, 0), out read))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Unable to read hidden console output");
+        }
+
+        int rows = (int)Math.Ceiling(read / (double)width);
+        int lastNonEmptyRow = -1;
+        int[] lineEnds = new int[rows];
+        for (int row = 0; row < rows; row++)
+        {
+            int start = row * width;
+            int end = Math.Min(start + width, (int)read);
+            while (end > start && (characters[end - 1] == ' ' || characters[end - 1] == '\0'))
+            {
+                end--;
+            }
+            lineEnds[row] = end;
+            if (end > start)
+            {
+                lastNonEmptyRow = row;
+            }
+        }
+
+        if (lastNonEmptyRow < 0)
+        {
+            return String.Empty;
+        }
+
+        StringBuilder result = new StringBuilder((lastNonEmptyRow + 1) * (width + 2));
+        for (int row = 0; row <= lastNonEmptyRow; row++)
+        {
+            int start = row * width;
+            int length = Math.Max(0, lineEnds[row] - start);
+            if (length > 0)
+            {
+                result.Append(characters, start, length);
+            }
+            if (row < lastNonEmptyRow)
+            {
+                result.Append("\r\n");
+            }
+        }
+        return result.ToString();
     }
 
     public static void SendConsoleInputLine(string text)
     {
-        IntPtr input = GetStdHandle(STD_INPUT_HANDLE);
-        uint mode;
-        if (input == IntPtr.Zero || input == new IntPtr(-1) || !GetConsoleMode(input, out mode))
-        {
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Hidden console input is unavailable");
-        }
-
+        IntPtr input = GetValidConsoleHandle(STD_INPUT_HANDLE, "Hidden console input");
         string value = (text ?? String.Empty) + "\r";
         InputRecord[] records = new InputRecord[value.Length * 2];
         for (int i = 0; i < value.Length; i++)
@@ -126,13 +337,14 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.6'
+$script:AppVersion = '1.3.7'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
 $script:SettingsPath = Join-Path $script:AppDir 'gui-settings.json'
 $script:QueuePath = Join-Path $script:AppDir 'gui-queue.json'
 $script:RuntimeDir = Join-Path $script:AppDir 'gui-runtime'
+$script:LastLoginDiagnosticPath = Join-Path $script:RuntimeDir 'last-login-error.log'
 $script:AccountCachePath = Join-Path $script:AppDir 'gui-account.json'
 $profileDirectory = [Environment]::GetFolderPath('UserProfile')
 if ([string]::IsNullOrWhiteSpace($profileDirectory)) { $profileDirectory = $env:USERPROFILE }
@@ -309,7 +521,6 @@ function Join-NativeArguments {
 
 function Get-CaptureBufferSize {
     param([string]$Kind)
-    if ($Kind -eq 'login') { return 1 }
     return 4096
 }
 
@@ -323,28 +534,56 @@ function Start-HiddenProcessCapture {
         throw "找不到 tdl.exe：$script:TdlPath"
     }
 
+    $consoleCapture = ($Kind -eq 'login')
     $runId = [Guid]::NewGuid().ToString('N')
-    $stdoutPath = Join-Path $script:RuntimeDir "$runId.out.log"
-    $stderrPath = Join-Path $script:RuntimeDir "$runId.err.log"
+    $stdoutPath = if ($consoleCapture) { '' } else { Join-Path $script:RuntimeDir "$runId.out.log" }
+    $stderrPath = if ($consoleCapture) { '' } else { Join-Path $script:RuntimeDir "$runId.err.log" }
     $captureBufferSize = Get-CaptureBufferSize $Kind
+
+    if ($consoleCapture) {
+        if (-not [TdlGuiNative]::HasConsoleInput() -or -not [TdlGuiNative]::HasConsoleOutput()) {
+            throw '登录需要 Windows 隐藏控制台，请从桌面快捷方式或“启动中文版下载器.vbs”打开软件。'
+        }
+        # survey.Password requires both stdin and stdout to be real console handles.
+        # The GUI reads the hidden console screen buffer instead of redirecting either stream.
+        [TdlGuiNative]::PrepareConsoleCapture(4096)
+    }
 
     $startInfo = New-Object System.Diagnostics.ProcessStartInfo
     $startInfo.FileName = $script:TdlPath
     $startInfo.Arguments = Join-NativeArguments $Arguments
     $startInfo.WorkingDirectory = $script:AppDir
     $startInfo.UseShellExecute = $false
-    # Login keeps the launcher's hidden console so tdl's terminal password prompt remains functional.
-    $startInfo.CreateNoWindow = ($Kind -ne 'login')
-    $startInfo.RedirectStandardOutput = $true
-    $startInfo.RedirectStandardError = $true
-    $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
-    $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    $startInfo.CreateNoWindow = (-not $consoleCapture)
+    $startInfo.RedirectStandardOutput = (-not $consoleCapture)
+    $startInfo.RedirectStandardError = (-not $consoleCapture)
+    if (-not $consoleCapture) {
+        $startInfo.StandardOutputEncoding = New-Object System.Text.UTF8Encoding($false)
+        $startInfo.StandardErrorEncoding = New-Object System.Text.UTF8Encoding($false)
+    }
 
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     if (-not $process.Start()) {
         throw '无法启动 tdl。'
     }
+
+    if ($consoleCapture) {
+        return [pscustomobject]@{
+            Kind           = $Kind
+            Process        = $process
+            ConsoleCapture = $true
+            StdoutPath     = ''
+            StderrPath     = ''
+            StdoutStream   = $null
+            StderrStream   = $null
+            StdoutTask     = $null
+            StderrTask     = $null
+            LastText       = ''
+            StopRequested  = $false
+        }
+    }
+
     $stdoutStream = New-Object System.IO.FileStream(
         $stdoutPath,
         [System.IO.FileMode]::Create,
@@ -364,16 +603,17 @@ function Start-HiddenProcessCapture {
     $stderrTask = $process.StandardError.BaseStream.CopyToAsync($stderrStream)
 
     return [pscustomobject]@{
-        Kind          = $Kind
-        Process       = $process
-        StdoutPath    = $stdoutPath
-        StderrPath    = $stderrPath
-        StdoutStream  = $stdoutStream
-        StderrStream  = $stderrStream
-        StdoutTask    = $stdoutTask
-        StderrTask    = $stderrTask
-        LastText      = ''
-        StopRequested = $false
+        Kind           = $Kind
+        Process        = $process
+        ConsoleCapture = $false
+        StdoutPath     = $stdoutPath
+        StderrPath     = $stderrPath
+        StdoutStream   = $stdoutStream
+        StderrStream   = $stderrStream
+        StdoutTask     = $stdoutTask
+        StderrTask     = $stderrTask
+        LastText       = ''
+        StopRequested  = $false
     }
 }
 
@@ -416,6 +656,13 @@ function Read-SharedUtf8File {
 function Get-RunText {
     param($Run)
     if ($null -eq $Run) { return '' }
+    if ([bool]$Run.ConsoleCapture) {
+        try {
+            $Run.LastText = [TdlGuiNative]::ReadConsoleBufferText()
+        }
+        catch {}
+        return [string]$Run.LastText
+    }
     $stdout = Read-SharedUtf8File $Run.StdoutPath
     $stderr = Read-SharedUtf8File $Run.StderrPath
     if ([string]::IsNullOrWhiteSpace($stderr)) { return $stdout }
@@ -431,13 +678,70 @@ function Remove-AnsiCodes {
     return $clean
 }
 
+function ConvertTo-SafeLoginDiagnostic {
+    param([string]$Text, [int]$ExitCode)
+
+    $clean = Remove-AnsiCodes $Text
+    $keptLines = New-Object System.Collections.Generic.List[string]
+    foreach ($line in ($clean -split "`n")) {
+        $trimmed = $line.TrimEnd("`r")
+        # Remove terminal QR artwork. It is not useful for diagnosis and can be very large.
+        if ($trimmed -match '[█▀▄]' -and $trimmed -match '^[ █▀▄]+$') { continue }
+        $keptLines.Add($trimmed)
+    }
+    $safe = ($keptLines -join "`r`n").Trim()
+    $safe = [regex]::Replace($safe, '(?im)^.*Enter\s+(?:Telegram\s+)?2FA\s+Password.*$', '[Telegram 两步验证密码提示已隐藏]')
+    $safe = [regex]::Replace($safe, '(?i)(?:https?://)?(?:t\.me|telegram\.me)/[^\s]+', '[Telegram 消息链接]')
+    $safe = [regex]::Replace($safe, '(?i)(https?|socks5?)://[^@\s/]+:[^@\s]+@', '$1://***@')
+    foreach ($privatePath in @(
+        [string]$script:AppDir,
+        [string]$script:RuntimeDir,
+        [string]$script:SessionPath,
+        [string]$script:Settings.DownloadDirectory
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace($privatePath)) {
+            $safe = $safe.Replace($privatePath, '[本地目录]')
+        }
+    }
+    $safe = [regex]::Replace($safe, '(?i)C:\\Users\\[^\\\s]+', '%USERPROFILE%')
+    if ($safe.Length -gt 120000) {
+        $safe = $safe.Substring($safe.Length - 120000)
+        $safe = "[前部内容过长，已省略]`r`n" + $safe
+    }
+    if ([string]::IsNullOrWhiteSpace($safe)) { $safe = '[tdl 未返回文字错误信息]' }
+
+    return @"
+tdl Chinese GUI v$($script:AppVersion)
+登录退出代码：$ExitCode
+记录时间：$([DateTime]::Now.ToString('yyyy-MM-dd HH:mm:ss'))
+
+$safe
+"@.Trim()
+}
+
+function Save-LoginDiagnostic {
+    param([string]$Text, [int]$ExitCode)
+
+    $diagnostic = ConvertTo-SafeLoginDiagnostic $Text $ExitCode
+    try {
+        Ensure-Directory $script:RuntimeDir
+        [IO.File]::WriteAllText($script:LastLoginDiagnosticPath, $diagnostic, (New-Object Text.UTF8Encoding($true)))
+    }
+    catch {}
+    return $diagnostic
+}
+
 function Complete-CapturedRun {
     param($Run)
     if ($null -eq $Run) { return }
-    try { [void]$Run.StdoutTask.Wait(1500) } catch {}
-    try { [void]$Run.StderrTask.Wait(1500) } catch {}
-    try { $Run.StdoutStream.Dispose() } catch {}
-    try { $Run.StderrStream.Dispose() } catch {}
+    if ([bool]$Run.ConsoleCapture) {
+        try { $Run.LastText = [TdlGuiNative]::ReadConsoleBufferText() } catch {}
+        return
+    }
+    try { if ($null -ne $Run.StdoutTask) { [void]$Run.StdoutTask.Wait(1500) } } catch {}
+    try { if ($null -ne $Run.StderrTask) { [void]$Run.StderrTask.Wait(1500) } } catch {}
+    try { if ($null -ne $Run.StdoutStream) { $Run.StdoutStream.Dispose() } } catch {}
+    try { if ($null -ne $Run.StderrStream) { $Run.StderrStream.Dispose() } } catch {}
 }
 
 function Remove-CapturedRunFiles {
@@ -657,7 +961,7 @@ function Get-FriendlyTdlError {
         return '登录二维码已过期，请点击“刷新二维码”后立即扫描。'
     }
     if ($clean -match '(?i)Incorrect function') {
-        return 'Windows 登录输入通道不兼容，请更新到 v1.3.6 或更高版本后重试。'
+        return 'Windows 登录终端不兼容，请更新到 v1.3.7 或更高版本，并从中文版启动入口打开软件。'
     }
     if ($clean -match '(?i)(PASSWORD_HASH_INVALID|2FA.*(?:invalid|incorrect)|invalid.*2FA|password.*(?:invalid|incorrect|wrong))') {
         return 'Telegram 两步验证密码不正确，请刷新二维码后重新登录。'
@@ -679,6 +983,16 @@ function Get-FriendlyTdlError {
     }
     if ($clean -match '(?i)(permission denied|access is denied)') {
         return '无法写入下载目录，请在“设置”中更换保存位置。'
+    }
+
+    $panicMatch = [regex]::Match($clean, '(?im)^\s*((?:panic|fatal error):\s*.+?)\s*$')
+    if ($panicMatch.Success) {
+        $panicReason = $panicMatch.Groups[1].Value.Trim()
+        if ($panicReason.Length -gt 120) { $panicReason = $panicReason.Substring(0, 120) + '…' }
+        return "tdl 登录组件发生内部异常：$panicReason"
+    }
+    if ($clean -match '(?im)(golang\.org/x/sync@.+/errgroup\.go:\d+|^goroutine \d+ \[.+\]:)') {
+        return 'tdl 登录组件发生内部异常，详细信息已保存在本机，可点击“复制错误信息”反馈。'
     }
 
     $usefulLines = @(($clean -split [char]10) | ForEach-Object { $_.Trim() } | Where-Object {
@@ -2114,9 +2428,18 @@ function Show-LoginDialog {
     $state = New-Object Windows.Forms.Label
     $state.Text = '正在生成二维码'
     $state.Location = New-Object Drawing.Point(22, 579)
-    $state.AutoSize = $true
+    $state.Size = New-Object Drawing.Size(225, 48)
+    $state.AutoEllipsis = $true
     $state.Anchor = 'Bottom,Left'
     $form.Controls.Add($state)
+
+    $copyLoginErrorButton = New-Object Windows.Forms.Button
+    $copyLoginErrorButton.Text = '复制错误信息'
+    $copyLoginErrorButton.Location = New-Object Drawing.Point(260, 574)
+    $copyLoginErrorButton.Size = New-Object Drawing.Size(115, 34)
+    $copyLoginErrorButton.Anchor = 'Bottom,Right'
+    $copyLoginErrorButton.Enabled = $false
+    $form.Controls.Add($copyLoginErrorButton)
 
     $refreshQrButton = New-Object Windows.Forms.Button
     $refreshQrButton.Text = '刷新二维码'
@@ -2133,10 +2456,11 @@ function Show-LoginDialog {
     $form.Controls.Add($closeButton)
 
     $loginUiState = [pscustomobject]@{
-        LastQrText          = ''
-        Generation          = 0
+        LastQrText           = ''
+        Generation           = 0
         TwoFactorPromptCount = 0
-        AwaitingTwoFactor   = $false
+        AwaitingTwoFactor    = $false
+        LastDiagnostic       = ''
     }
     $startLogin = {
         if ($null -ne $script:LoginRun) {
@@ -2153,6 +2477,8 @@ function Show-LoginDialog {
         $loginUiState.Generation = 0
         $loginUiState.TwoFactorPromptCount = 0
         $loginUiState.AwaitingTwoFactor = $false
+        $loginUiState.LastDiagnostic = ''
+        $copyLoginErrorButton.Enabled = $false
         $passwordBox.Clear()
         $passwordBox.Enabled = $true
         $submitPasswordButton.Enabled = $true
@@ -2253,8 +2579,8 @@ function Show-LoginDialog {
         if ($script:LoginRun.Process.HasExited) {
             $loginTimer.Stop()
             $exitCode = $script:LoginRun.Process.ExitCode
-            $clean = Remove-AnsiCodes (Get-RunText $script:LoginRun)
             Complete-CapturedRun $script:LoginRun
+            $clean = Remove-AnsiCodes (Get-RunText $script:LoginRun)
             $passwordBox.Clear()
             $passwordBox.Enabled = $false
             $submitPasswordButton.Enabled = $false
@@ -2272,12 +2598,19 @@ function Show-LoginDialog {
                     try { Remove-Item -LiteralPath $script:AccountCachePath -Force } catch {}
                 }
                 Update-LoginIndicator
+                $loginUiState.LastDiagnostic = ''
+                $copyLoginErrorButton.Enabled = $false
+                if (Test-Path -LiteralPath $script:LastLoginDiagnosticPath) {
+                    try { Remove-Item -LiteralPath $script:LastLoginDiagnosticPath -Force } catch {}
+                }
             }
             elseif (-not $script:LoginRun.StopRequested) {
                 $friendlyLoginError = Get-FriendlyTdlError $clean $exitCode
-                $state.Text = $friendlyLoginError
+                $loginUiState.LastDiagnostic = Save-LoginDiagnostic $clean $exitCode
+                $copyLoginErrorButton.Enabled = $true
+                $state.Text = '登录失败，可复制错误信息'
                 $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
-                $qrBox.Text = $friendlyLoginError + "`r`n`r`n" + '请点击“刷新二维码”后重试。'
+                $qrBox.Text = $friendlyLoginError + "`r`n`r`n" + '已保留经过隐私处理的完整错误。可点击“复制错误信息”反馈，或刷新二维码后重试。'
                 $refreshQrButton.Enabled = $true
             }
             try { $script:LoginRun.Process.Dispose() } catch {}
@@ -2292,6 +2625,20 @@ function Show-LoginDialog {
         if ($_.KeyCode -eq [Windows.Forms.Keys]::Enter) {
             $_.SuppressKeyPress = $true
             & $submitPassword
+        }
+    })
+
+    $copyLoginErrorButton.Add_Click({
+        if (-not [string]::IsNullOrWhiteSpace([string]$loginUiState.LastDiagnostic)) {
+            try {
+                [Windows.Forms.Clipboard]::SetText([string]$loginUiState.LastDiagnostic)
+                $state.Text = '错误信息已复制，可以直接粘贴反馈'
+                $state.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
+            }
+            catch {
+                $state.Text = '复制失败，请稍后再试'
+                $state.ForeColor = [Drawing.Color]::FromArgb(196, 43, 28)
+            }
         }
     })
 
@@ -2343,8 +2690,8 @@ if ($SelfTest) {
     if ($commonArgumentTest -isnot [System.Collections.Generic.List[string]]) {
         throw 'SELFTEST: common arguments are not mutable'
     }
-    if ((Get-CaptureBufferSize 'login') -ne 1 -or (Get-CaptureBufferSize 'download') -lt 4096) {
-        throw 'SELFTEST: login capture is not configured for immediate output'
+    if ((Get-CaptureBufferSize 'login') -lt 4096 -or (Get-CaptureBufferSize 'download') -lt 4096) {
+        throw 'SELFTEST: process capture buffers are too small'
     }
     $loginArgumentTest = Get-LoginArguments
     if ($loginArgumentTest -notcontains 'login' -or $loginArgumentTest -notcontains 'qr') {
@@ -2411,28 +2758,34 @@ if ($SelfTest) {
     if ($consoleInputEventCountTest -ne 10 -or $consoleInputRecordSizeTest -ne 20) {
         throw "SELFTEST: hidden-console password input records are invalid (events=$consoleInputEventCountTest, size=$consoleInputRecordSizeTest)"
     }
-    if ([TdlGuiNative]::HasConsoleInput()) {
+    $hasConsoleIo = [TdlGuiNative]::HasConsoleInput() -and [TdlGuiNative]::HasConsoleOutput()
+    if ($RequireConsoleIoSelfTest -and -not $hasConsoleIo) {
+        throw 'SELFTEST: the real hidden launcher did not provide console I/O'
+    }
+    if ($hasConsoleIo) {
+        [TdlGuiNative]::PrepareConsoleCapture(512)
         $consoleProbeInfo = New-Object System.Diagnostics.ProcessStartInfo
         $consoleProbeInfo.FileName = "$env:SystemRoot\System32\cmd.exe"
-        $consoleProbeInfo.Arguments = '/d /q /v:on /c "set /p probe=READY: & echo INPUT_OK:!probe!"'
+        $consoleProbeInfo.Arguments = '/d /q /v:on /c "echo CONSOLE_OUTPUT_PROBE & set /p probe=READY: & echo INPUT_OK:!probe!"'
         $consoleProbeInfo.UseShellExecute = $false
         $consoleProbeInfo.CreateNoWindow = $false
-        $consoleProbeInfo.RedirectStandardOutput = $true
-        $consoleProbeInfo.RedirectStandardError = $true
+        $consoleProbeInfo.RedirectStandardOutput = $false
+        $consoleProbeInfo.RedirectStandardError = $false
         $consoleProbe = New-Object System.Diagnostics.Process
         $consoleProbe.StartInfo = $consoleProbeInfo
         try {
-            if (-not $consoleProbe.Start()) { throw 'SELFTEST: console-input probe did not start' }
+            if (-not $consoleProbe.Start()) { throw 'SELFTEST: console-I/O probe did not start' }
             Start-Sleep -Milliseconds 200
             [TdlGuiNative]::SendConsoleInputLine('TdlGuiProbe')
             if (-not $consoleProbe.WaitForExit(5000)) {
-                throw 'SELFTEST: hidden-console input probe timed out'
+                throw 'SELFTEST: hidden-console I/O probe timed out'
             }
-            $consoleProbeOutput = $consoleProbe.StandardOutput.ReadToEnd()
-            if ($consoleProbeOutput -notmatch 'INPUT_OK:TdlGuiProbe') {
-                throw "SELFTEST: hidden-console input bridge failed: $consoleProbeOutput"
+            Start-Sleep -Milliseconds 100
+            $consoleProbeOutput = [TdlGuiNative]::ReadConsoleBufferText()
+            if ($consoleProbeOutput -notmatch 'CONSOLE_OUTPUT_PROBE' -or $consoleProbeOutput -notmatch 'INPUT_OK:TdlGuiProbe') {
+                throw "SELFTEST: hidden-console I/O bridge failed: $consoleProbeOutput"
             }
-            Write-Output 'CONSOLE_INPUT_SELFTEST_OK'
+            Write-Output 'CONSOLE_IO_SELFTEST_OK'
         }
         finally {
             if (-not $consoleProbe.HasExited) { try { $consoleProbe.Kill() } catch {} }
@@ -2442,8 +2795,17 @@ if ($SelfTest) {
     if ((Get-FriendlyTdlError 'PASSWORD_HASH_INVALID' 1) -notmatch '两步验证密码不正确') {
         throw 'SELFTEST: invalid 2FA password error was not translated'
     }
-    if ((Get-FriendlyTdlError 'Incorrect function.' 1) -notmatch 'v1.3.6') {
-        throw 'SELFTEST: Windows console-input error was not translated'
+    if ((Get-FriendlyTdlError 'Incorrect function.' 1) -notmatch 'v1.3.7') {
+        throw 'SELFTEST: Windows console-I/O error was not translated'
+    }
+    if ((Get-FriendlyTdlError 'panic: runtime error: terminal handle failed' 2) -notmatch '内部异常') {
+        throw 'SELFTEST: Go panic was not translated'
+    }
+    $safeLoginDiagnosticTest = ConvertTo-SafeLoginDiagnostic ("████`r`npanic: example in " + $script:AppDir + "`r`nhttps://t.me/demo/123") 2
+    if ($safeLoginDiagnosticTest -match '████' -or
+        $safeLoginDiagnosticTest -match [regex]::Escape($script:AppDir) -or
+        $safeLoginDiagnosticTest -match 't\.me/demo') {
+        throw 'SELFTEST: login diagnostic was not sanitized'
     }
     $redactedErrorTest = Get-FriendlyTdlError ('failure in ' + $script:AppDir) 1
     if ($redactedErrorTest -match [regex]::Escape($script:AppDir)) {

@@ -6,7 +6,7 @@
 
 ![Windows](https://img.shields.io/badge/Windows-10%2F11-0078D4?logo=windows)
 ![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5391FE?logo=powershell)
-![GUI](https://img.shields.io/badge/GUI-v1.3.6-16A085)
+![GUI](https://img.shields.io/badge/GUI-v1.3.7-16A085)
 ![tdl](https://img.shields.io/badge/tdl-v0.20.4-2CA5E0)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue)
 
@@ -37,11 +37,11 @@ tdl 功能强大，但原版主要通过命令行使用。本项目为它增加�
 - 在窗口内完成 Telegram 二维码登录
 - 显示当前账号名称、账号 ID 和连接状态
 - 登录二维码即时显示和自动换新，并可手动点击“刷新二维码”
-- 扫码后自动显示 Telegram 两步验证密码框，通过 Windows 隐藏控制台兼容输入，支持回车提交且不保存密码
+- 扫码后自动显示 Telegram 两步验证密码框；输入和输出均使用 Windows 隐藏终端，支持回车提交且不保存密码
 - 可粘贴一整段文字，自动识别其中的 Telegram 消息链接
 - 新增机器人 / 受保护聊天下载：无需消息链接，自动读取聊天列表并下载最近媒体
 - 无链接下载可查看和更改保存目录，开始前自动检查目录是否可写
-- 失败时显示具体处理阶段，并可一键复制经过整理的错误信息
+- 登录或下载失败时显示具体处理阶段，并可一键复制经过隐私处理的完整错误信息
 - 多链接队列连续下载，下载完成后窗口不会退出
 - 队列支持统计、重试、删除和打开 Telegram 原消息
 - 失败原因尽量转换成易懂的中文，并按设置自动重试
