@@ -337,7 +337,7 @@ if (-not $SelfTest -and -not $AccountSelfTest -and [string]::IsNullOrWhiteSpace(
 }
 
 $script:AppDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:AppVersion = '1.3.7'
+$script:AppVersion = '1.4.0'
 $script:TdlPath = Join-Path $script:AppDir 'tdl.exe'
 $script:InstallerPath = Join-Path $script:AppDir '一键安装或更新.bat'
 $script:DownloadsDefault = Join-Path $script:AppDir 'downloads'
@@ -825,7 +825,7 @@ function Get-ChatExportArguments {
         [string]$OutputPath
     )
     $arguments = Get-CommonArguments
-    foreach ($argument in @('chat', 'export', '-c', $ChatId, '-T', 'last', '-i', [string]$MediaCount, '-o', $OutputPath)) {
+    foreach ($argument in @('chat', 'export', '-c', $ChatId, '-T', 'last', '-i', [string]$MediaCount, '--with-content', '-o', $OutputPath)) {
         $arguments.Add([string]$argument)
     }
     return $arguments.ToArray()
@@ -1609,6 +1609,305 @@ function Finish-CurrentDownload {
         Start-NextDownload
     }
 }
+function Get-TdlMediaTypeLabel {
+    param([string]$FileName)
+
+    $extension = [IO.Path]::GetExtension([string]$FileName).ToLowerInvariant()
+    if ($extension -in @('.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.heic', '.tif', '.tiff')) { return '图片' }
+    if ($extension -in @('.mp4', '.mkv', '.mov', '.avi', '.webm', '.m4v', '.ts', '.flv', '.wmv')) { return '视频' }
+    if ($extension -in @('.mp3', '.m4a', '.wav', '.flac', '.ogg', '.opus', '.aac', '.wma')) { return '音频' }
+    return '文件'
+}
+
+function ConvertFrom-TdlMediaExportJson {
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { throw '媒体索引内容为空。' }
+    try { $data = $Text | ConvertFrom-Json }
+    catch { throw "媒体索引不是有效的 JSON：$($_.Exception.Message)" }
+
+    $idProperty = $data.PSObject.Properties['id']
+    $messagesProperty = $data.PSObject.Properties['messages']
+    if ($null -eq $idProperty -or $null -eq $messagesProperty) {
+        throw '媒体索引缺少聊天 ID 或消息列表。'
+    }
+
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($message in @($messagesProperty.Value)) {
+        if ($null -eq $message) { continue }
+        $messageIdProperty = $message.PSObject.Properties['id']
+        $fileProperty = $message.PSObject.Properties['file']
+        $dateProperty = $message.PSObject.Properties['date']
+        $textProperty = $message.PSObject.Properties['text']
+        $messageId = if ($null -eq $messageIdProperty) { '' } else { [string]$messageIdProperty.Value }
+        if ([string]::IsNullOrWhiteSpace($messageId)) { continue }
+        $fileName = if ($null -eq $fileProperty) { '' } else { [string]$fileProperty.Value }
+        if ([string]::IsNullOrWhiteSpace($fileName)) { $fileName = '未命名媒体' }
+        $dateUnix = 0L
+        if ($null -ne $dateProperty) { [void][long]::TryParse([string]$dateProperty.Value, [ref]$dateUnix) }
+        $dateText = '—'
+        if ($dateUnix -gt 0) {
+            try { $dateText = [DateTimeOffset]::FromUnixTimeSeconds($dateUnix).LocalDateTime.ToString('yyyy-MM-dd HH:mm') }
+            catch {}
+        }
+        $caption = if ($null -eq $textProperty) { '' } else { ([string]$textProperty.Value -replace '\s+', ' ').Trim() }
+        if ($caption.Length -gt 160) { $caption = $caption.Substring(0, 160) + '…' }
+        $items.Add([pscustomobject]@{
+            Id         = $messageId
+            FileName   = $fileName
+            MediaType  = Get-TdlMediaTypeLabel $fileName
+            DateUnix   = $dateUnix
+            DateText   = $dateText
+            Caption    = $caption
+            RawMessage = $message
+            Selected   = $false
+        })
+    }
+
+    return [pscustomobject]@{
+        ChatId = [long]$idProperty.Value
+        Items  = $items.ToArray()
+    }
+}
+
+function ConvertTo-TdlSelectedExportJson {
+    param(
+        $ExportData,
+        [string[]]$SelectedIds
+    )
+
+    if ($null -eq $ExportData) { throw '媒体索引不存在。' }
+    $wanted = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+    foreach ($id in @($SelectedIds)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$id)) { [void]$wanted.Add([string]$id) }
+    }
+    if ($wanted.Count -eq 0) { throw '请至少选择一个媒体。' }
+
+    $messages = New-Object System.Collections.Generic.List[object]
+    foreach ($item in @($ExportData.Items)) {
+        if ($wanted.Contains([string]$item.Id)) { $messages.Add($item.RawMessage) }
+    }
+    if ($messages.Count -eq 0) { throw '所选媒体不在当前索引中，请重新加载。' }
+
+    $payload = [ordered]@{
+        id       = [long]$ExportData.ChatId
+        messages = $messages.ToArray()
+    }
+    return ($payload | ConvertTo-Json -Depth 16)
+}
+
+function Write-TdlSelectedExport {
+    param(
+        [string]$Path,
+        $ExportData,
+        [string[]]$SelectedIds
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw '媒体索引保存路径为空。' }
+    $json = ConvertTo-TdlSelectedExportJson $ExportData $SelectedIds
+    [IO.File]::WriteAllText($Path, $json, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Show-MediaSelectionDialog {
+    param(
+        [Windows.Forms.IWin32Window]$Owner,
+        $ExportData,
+        [string]$ChatName
+    )
+
+    $mediaItems = @($ExportData.Items)
+    $dialogState = [pscustomobject]@{
+        Confirmed = $false
+        Selected  = @()
+    }
+
+    $form = New-Object Windows.Forms.Form
+    $form.Text = '挑选要下载的媒体'
+    $form.StartPosition = 'CenterParent'
+    $form.FormBorderStyle = 'Sizable'
+    $form.MinimumSize = New-Object Drawing.Size(780, 560)
+    $form.ClientSize = New-Object Drawing.Size(920, 620)
+    $form.Font = New-Object Drawing.Font('Microsoft YaHei UI', 9)
+
+    $title = New-Object Windows.Forms.Label
+    $title.Text = '从“' + $ChatName + '”挑选媒体'
+    $title.Font = New-Object Drawing.Font('Microsoft YaHei UI', 12, [Drawing.FontStyle]::Bold)
+    $title.Location = New-Object Drawing.Point(20, 16)
+    $title.Size = New-Object Drawing.Size(875, 30)
+    $title.AutoEllipsis = $true
+    $form.Controls.Add($title)
+
+    $hint = New-Object Windows.Forms.Label
+    $hint.Text = '勾选需要下载的项目。这里显示的是媒体索引，不会为了预览而提前下载文件。'
+    $hint.Location = New-Object Drawing.Point(20, 48)
+    $hint.Size = New-Object Drawing.Size(875, 24)
+    $hint.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($hint)
+
+    $searchLabel = New-Object Windows.Forms.Label
+    $searchLabel.Text = '搜索'
+    $searchLabel.Location = New-Object Drawing.Point(20, 84)
+    $searchLabel.AutoSize = $true
+    $form.Controls.Add($searchLabel)
+
+    $searchBox = New-Object Windows.Forms.TextBox
+    $searchBox.Location = New-Object Drawing.Point(65, 80)
+    $searchBox.Size = New-Object Drawing.Size(470, 28)
+    $searchBox.Anchor = 'Top,Left,Right'
+    $form.Controls.Add($searchBox)
+
+    $typeLabel = New-Object Windows.Forms.Label
+    $typeLabel.Text = '类型'
+    $typeLabel.Location = New-Object Drawing.Point(555, 84)
+    $typeLabel.Anchor = 'Top,Right'
+    $typeLabel.AutoSize = $true
+    $form.Controls.Add($typeLabel)
+
+    $typeBox = New-Object Windows.Forms.ComboBox
+    $typeBox.Location = New-Object Drawing.Point(598, 80)
+    $typeBox.Size = New-Object Drawing.Size(130, 28)
+    $typeBox.Anchor = 'Top,Right'
+    $typeBox.DropDownStyle = 'DropDownList'
+    [void]$typeBox.Items.AddRange(@('全部类型', '视频', '图片', '音频', '文件'))
+    $typeBox.SelectedIndex = 0
+    $form.Controls.Add($typeBox)
+
+    $selectAllButton = New-Object Windows.Forms.Button
+    $selectAllButton.Text = '全选当前'
+    $selectAllButton.Location = New-Object Drawing.Point(743, 78)
+    $selectAllButton.Size = New-Object Drawing.Size(75, 31)
+    $selectAllButton.Anchor = 'Top,Right'
+    $form.Controls.Add($selectAllButton)
+
+    $clearButton = New-Object Windows.Forms.Button
+    $clearButton.Text = '清空选择'
+    $clearButton.Location = New-Object Drawing.Point(825, 78)
+    $clearButton.Size = New-Object Drawing.Size(75, 31)
+    $clearButton.Anchor = 'Top,Right'
+    $form.Controls.Add($clearButton)
+
+    $mediaList = New-Object Windows.Forms.ListView
+    $mediaList.Location = New-Object Drawing.Point(20, 120)
+    $mediaList.Size = New-Object Drawing.Size(880, 420)
+    $mediaList.Anchor = 'Top,Bottom,Left,Right'
+    $mediaList.View = 'Details'
+    $mediaList.CheckBoxes = $true
+    $mediaList.FullRowSelect = $true
+    $mediaList.GridLines = $true
+    $mediaList.HideSelection = $false
+    [void]$mediaList.Columns.Add('类型', 65)
+    [void]$mediaList.Columns.Add('时间', 135)
+    [void]$mediaList.Columns.Add('文件名', 235)
+    [void]$mediaList.Columns.Add('消息说明', 340)
+    [void]$mediaList.Columns.Add('消息 ID', 80)
+    $form.Controls.Add($mediaList)
+
+    $summary = New-Object Windows.Forms.Label
+    $summary.Location = New-Object Drawing.Point(20, 557)
+    $summary.Size = New-Object Drawing.Size(470, 28)
+    $summary.Anchor = 'Bottom,Left,Right'
+    $summary.ForeColor = [Drawing.Color]::DimGray
+    $form.Controls.Add($summary)
+
+    $downloadSelectedButton = New-Object Windows.Forms.Button
+    $downloadSelectedButton.Text = '下载已选媒体'
+    $downloadSelectedButton.Location = New-Object Drawing.Point(655, 555)
+    $downloadSelectedButton.Size = New-Object Drawing.Size(135, 38)
+    $downloadSelectedButton.Anchor = 'Bottom,Right'
+    $downloadSelectedButton.BackColor = [Drawing.Color]::FromArgb(0, 120, 212)
+    $downloadSelectedButton.ForeColor = [Drawing.Color]::White
+    $downloadSelectedButton.FlatStyle = 'Flat'
+    $downloadSelectedButton.Enabled = $false
+    $form.Controls.Add($downloadSelectedButton)
+
+    $cancelButton = New-Object Windows.Forms.Button
+    $cancelButton.Text = '取消'
+    $cancelButton.Location = New-Object Drawing.Point(800, 555)
+    $cancelButton.Size = New-Object Drawing.Size(100, 38)
+    $cancelButton.Anchor = 'Bottom,Right'
+    $form.Controls.Add($cancelButton)
+
+    $updateSummary = {
+        $selectedCount = @($mediaItems | Where-Object { [bool]$_.Selected }).Count
+        $summary.Text = "已加载 $($mediaItems.Count) 个媒体，已选择 $selectedCount 个"
+        $downloadSelectedButton.Enabled = ($selectedCount -gt 0)
+    }.GetNewClosure()
+
+    $renderMedia = {
+        $query = $searchBox.Text.Trim()
+        $selectedType = [string]$typeBox.SelectedItem
+        $mediaList.BeginUpdate()
+        try {
+            $mediaList.Items.Clear()
+            foreach ($media in $mediaItems) {
+                if ($selectedType -ne '全部类型' -and [string]$media.MediaType -ne $selectedType) { continue }
+                if (-not [string]::IsNullOrWhiteSpace($query)) {
+                    $haystack = ([string]$media.FileName + ' ' + [string]$media.Caption + ' ' + [string]$media.Id)
+                    if ($haystack.IndexOf($query, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+                }
+                $row = New-Object Windows.Forms.ListViewItem([string]$media.MediaType)
+                [void]$row.SubItems.Add([string]$media.DateText)
+                [void]$row.SubItems.Add([string]$media.FileName)
+                $captionText = if ([string]::IsNullOrWhiteSpace([string]$media.Caption)) { '—' } else { [string]$media.Caption }
+                [void]$row.SubItems.Add($captionText)
+                [void]$row.SubItems.Add([string]$media.Id)
+                $row.Tag = $media
+                $row.Checked = [bool]$media.Selected
+                [void]$mediaList.Items.Add($row)
+            }
+        }
+        finally { $mediaList.EndUpdate() }
+        & $updateSummary
+    }.GetNewClosure()
+
+    $mediaList.Add_ItemCheck({
+        if ($_.Index -ge 0 -and $_.Index -lt $mediaList.Items.Count) {
+            $item = $mediaList.Items[$_.Index].Tag
+            if ($null -ne $item) {
+                $item.Selected = ($_.NewValue -eq [Windows.Forms.CheckState]::Checked)
+                & $updateSummary
+            }
+        }
+    }.GetNewClosure())
+    $mediaList.Add_DoubleClick({
+        if ($mediaList.SelectedItems.Count -gt 0) {
+            $row = $mediaList.SelectedItems[0]
+            $row.Checked = -not $row.Checked
+        }
+    }.GetNewClosure())
+    $searchBox.Add_TextChanged($renderMedia)
+    $typeBox.Add_SelectedIndexChanged($renderMedia)
+    $selectAllButton.Add_Click({
+        foreach ($row in $mediaList.Items) {
+            $row.Tag.Selected = $true
+            $row.Checked = $true
+        }
+        & $updateSummary
+    }.GetNewClosure())
+    $clearButton.Add_Click({
+        foreach ($media in $mediaItems) { $media.Selected = $false }
+        foreach ($row in $mediaList.Items) { $row.Checked = $false }
+        & $updateSummary
+    }.GetNewClosure())
+    $downloadSelectedButton.Add_Click({
+        $selected = @($mediaItems | Where-Object { [bool]$_.Selected })
+        if ($selected.Count -eq 0) {
+            [void][Windows.Forms.MessageBox]::Show($form, '请至少勾选一个媒体。', '挑选媒体', 'OK', 'Information')
+            return
+        }
+        $dialogState.Confirmed = $true
+        $dialogState.Selected = $selected
+        $form.DialogResult = [Windows.Forms.DialogResult]::OK
+        $form.Close()
+    }.GetNewClosure())
+    $cancelButton.Add_Click({ $form.Close() })
+
+    & $renderMedia
+    [void]$form.ShowDialog($Owner)
+    $form.Dispose()
+    return $dialogState
+}
+
 function Show-ProtectedChatDialog {
     if (-not (Test-Path -LiteralPath $script:SessionPath)) {
         [void][Windows.Forms.MessageBox]::Show(
@@ -1660,7 +1959,7 @@ function Show-ProtectedChatDialog {
     $form.Controls.Add($title)
 
     $hint = New-Object Windows.Forms.Label
-    $hint.Text = '程序会读取当前账号的聊天列表。机器人会排在最前；默认只下载所选聊天最近 1 个媒体，普通文字消息会自动忽略。'
+    $hint.Text = '程序会读取当前账号的聊天列表。选择聊天并加载媒体清单后，可按类型或关键词筛选，再勾选需要下载的项目。'
     $hint.Location = New-Object Drawing.Point(22, 53)
     $hint.Size = New-Object Drawing.Size(735, 42)
     $hint.ForeColor = [Drawing.Color]::DimGray
@@ -1698,7 +1997,7 @@ function Show-ProtectedChatDialog {
     $form.Controls.Add($chatList)
 
     $countLabel = New-Object Windows.Forms.Label
-    $countLabel.Text = '下载最近的媒体数量'
+    $countLabel.Text = '加载最近的媒体数量'
     $countLabel.Location = New-Object Drawing.Point(22, 485)
     $countLabel.AutoSize = $true
     $form.Controls.Add($countLabel)
@@ -1707,12 +2006,12 @@ function Show-ProtectedChatDialog {
     $countBox.Location = New-Object Drawing.Point(175, 481)
     $countBox.Size = New-Object Drawing.Size(75, 28)
     $countBox.Minimum = 1
-    $countBox.Maximum = 100
-    $countBox.Value = 1
+    $countBox.Maximum = 300
+    $countBox.Value = 30
     $form.Controls.Add($countBox)
 
     $countHint = New-Object Windows.Forms.Label
-    $countHint.Text = '建议先保持 1；需要批量下载时再增加。'
+    $countHint.Text = '加载后可按类型、时间、文件名和消息说明勾选。'
     $countHint.Location = New-Object Drawing.Point(270, 485)
     $countHint.AutoSize = $true
     $countHint.ForeColor = [Drawing.Color]::DimGray
@@ -1758,7 +2057,7 @@ function Show-ProtectedChatDialog {
     $form.Controls.Add($openFolderButton)
 
     $downloadButton = New-Object Windows.Forms.Button
-    $downloadButton.Text = '开始下载'
+    $downloadButton.Text = '加载媒体'
     $downloadButton.Location = New-Object Drawing.Point(590, 610)
     $downloadButton.Size = New-Object Drawing.Size(100, 36)
     $downloadButton.BackColor = [Drawing.Color]::FromArgb(0, 120, 212)
@@ -1778,7 +2077,8 @@ function Show-ProtectedChatDialog {
         Phase        = 'idle'
         Chats        = @()
         ExportPath   = ''
-        MediaCount   = 1
+        MediaCount   = 0
+        ChatName      = ''
         LastError    = ''
     }
 
@@ -1813,7 +2113,8 @@ function Show-ProtectedChatDialog {
         $phaseLabel = switch ($failedPhase) {
             'list'     { '读取聊天列表失败' }
             'prepare'  { '下载前检查失败' }
-            'export'   { '查找最近媒体失败' }
+            'export'   { '加载媒体清单失败' }
+            'select'   { '媒体选择失败' }
             'download' { '下载媒体失败' }
             default    { '操作失败' }
         }
@@ -1894,33 +2195,25 @@ function Show-ProtectedChatDialog {
     $startDownload = {
         if ($null -ne $state.Run) { return }
         if ($chatList.SelectedItems.Count -eq 0) {
-            [void][Windows.Forms.MessageBox]::Show($form, '请先选择视频所在的机器人或聊天。', '无链接下载', 'OK', 'Information')
+            [void][Windows.Forms.MessageBox]::Show($form, '请先选择媒体所在的机器人或聊天。', '无链接下载', 'OK', 'Information')
             return
         }
 
         $chat = $chatList.SelectedItems[0].Tag
         $count = [int]$countBox.Value
-        $answer = [Windows.Forms.MessageBox]::Show(
-            $form,
-            ('将从“' + [string]$chat.VisibleName + '”下载最近 ' + $count + ' 个媒体。普通文字消息会自动忽略。是否继续？'),
-            '确认无链接下载',
-            [Windows.Forms.MessageBoxButtons]::YesNo,
-            [Windows.Forms.MessageBoxIcon]::Question
-        )
-        if ($answer -ne [Windows.Forms.DialogResult]::Yes) { return }
-
         $state.Phase = 'prepare'
         & $clearError
         try {
             Assert-DirectoryWritable $pathContext.DownloadDirectory
             Ensure-Directory $pathContext.RuntimeDirectory
             $state.ExportPath = Join-Path $pathContext.RuntimeDirectory ("protected-" + [Guid]::NewGuid().ToString('N') + '.json')
-            $state.MediaCount = $count
+            $state.MediaCount = 0
+            $state.ChatName = [string]$chat.VisibleName
             $state.Phase = 'export'
             $status.ForeColor = [Drawing.Color]::FromArgb(34, 99, 171)
             $progress.Style = 'Marquee'
             $progress.MarqueeAnimationSpeed = 24
-            & $setBusy $true "正在从所选聊天查找最近 $count 个媒体……"
+            & $setBusy $true "正在加载最近 $count 个媒体供选择……"
             $state.Run = Start-HiddenProcessCapture (Get-ChatExportArguments ([string]$chat.Id) $count $state.ExportPath) 'protected-export'
         }
         catch {
@@ -1997,9 +2290,32 @@ function Show-ProtectedChatDialog {
                 return
             }
             try {
+                $exportText = [IO.File]::ReadAllText($state.ExportPath)
+                $exportData = ConvertFrom-TdlMediaExportJson $exportText
+                if (@($exportData.Items).Count -eq 0) {
+                    throw '所选范围内没有可下载的媒体，请增加加载数量后重试。'
+                }
+
+                $state.Phase = 'select'
+                $progress.Style = 'Blocks'
+                $progress.Value = 0
+                $status.Text = "已加载 $(@($exportData.Items).Count) 个媒体，请在弹出的窗口中勾选。"
+                $selection = Show-MediaSelectionDialog $form $exportData $state.ChatName
+                if (-not [bool]$selection.Confirmed) {
+                    & $removeExport
+                    $state.Phase = 'idle'
+                    $status.Text = '已取消媒体选择，未开始下载。'
+                    $status.ForeColor = [Drawing.Color]::DimGray
+                    & $setBusy $false ''
+                    return
+                }
+
+                $selectedIds = @($selection.Selected | ForEach-Object { [string]$_.Id })
+                Write-TdlSelectedExport $state.ExportPath $exportData $selectedIds
+                $state.MediaCount = $selectedIds.Count
                 Ensure-Directory $pathContext.DownloadDirectory
                 $state.Phase = 'download'
-                $status.Text = '已找到媒体，正在开始下载……'
+                $status.Text = "已选择 $($state.MediaCount) 个媒体，正在开始下载……"
                 $progress.Style = 'Marquee'
                 $progress.MarqueeAnimationSpeed = 24
                 $state.Run = Start-HiddenProcessCapture (Get-ExportDownloadArguments $state.ExportPath $pathContext.DownloadDirectory) 'protected-download'
@@ -2022,10 +2338,10 @@ function Show-ProtectedChatDialog {
             $progress.Style = 'Continuous'
             $progress.Value = 100
             $status.ForeColor = [Drawing.Color]::FromArgb(16, 124, 16)
-            $status.Text = "下载完成：已处理最近 $($state.MediaCount) 个媒体。"
+            $status.Text = "下载完成：已处理所选 $($state.MediaCount) 个媒体。"
             & $clearError
             & $setBusy $false ''
-            $completionMessage = "机器人 / 受保护聊天下载完成，已处理最近 $($state.MediaCount) 个媒体。"
+            $completionMessage = "机器人 / 受保护聊天下载完成，已处理所选 $($state.MediaCount) 个媒体。"
             Append-Log $completionMessage
             Show-CompletionNotification $completionMessage
         }
@@ -2722,9 +3038,25 @@ if ($SelfTest) {
     if ($chatListTest.Count -ne 2 -or -not $chatListTest[0].IsBot -or $chatListTest[1].IsBot -or $chatListTest[1].Username -ne '') {
         throw 'SELFTEST: chat list parsing or bot detection failed'
     }
-    $chatExportTest = Get-ChatExportArguments '123' 1 'D:\temp\protected.json'
-    if ($chatExportTest -notcontains 'export' -or $chatExportTest -notcontains 'last' -or $chatExportTest -notcontains '123') {
+    $chatExportTest = Get-ChatExportArguments '123' 30 'D:\temp\protected.json'
+    if ($chatExportTest -notcontains 'export' -or $chatExportTest -notcontains 'last' -or
+        $chatExportTest -notcontains '123' -or $chatExportTest -notcontains '--with-content') {
         throw 'SELFTEST: protected chat export arguments are incomplete'
+    }
+    $mediaExportJsonTest = '{"id":123,"messages":[{"id":1001,"type":"document","file":"sample-video.mp4","date":1700000000,"text":"第一段视频"},{"id":1002,"type":"document","file":"sample-photo.jpg","date":1700000100,"text":"示例图片"}]}'
+    $mediaExportTest = ConvertFrom-TdlMediaExportJson $mediaExportJsonTest
+    if (@($mediaExportTest.Items).Count -ne 2 -or
+        $mediaExportTest.Items[0].MediaType -ne '视频' -or
+        $mediaExportTest.Items[1].MediaType -ne '图片' -or
+        $mediaExportTest.Items[0].DateText -eq '—') {
+        throw 'SELFTEST: targeted media list parsing failed'
+    }
+    $selectedExportJsonTest = ConvertTo-TdlSelectedExportJson $mediaExportTest @('1002')
+    $selectedExportTest = $selectedExportJsonTest | ConvertFrom-Json
+    if ([long]$selectedExportTest.id -ne 123 -or
+        @($selectedExportTest.messages).Count -ne 1 -or
+        [string]$selectedExportTest.messages[0].id -ne '1002') {
+        throw 'SELFTEST: targeted media selection export failed'
     }
     $customDownloadDirectoryTest = 'D:\temp\custom downloads'
     $fileDownloadTest = Get-ExportDownloadArguments 'D:\temp\protected.json' $customDownloadDirectoryTest
@@ -3231,7 +3563,7 @@ $helpButton.Add_Click({
         '1. 首次使用先点右上角【登录 / 更换账号】扫码。' + [Environment]::NewLine +
         '2. 有消息链接时可粘贴链接或整段聊天文字，程序会自动识别。' + [Environment]::NewLine +
         '3. 机器人不提供消息链接时，点击【机器人 / 无链接下载】。' + [Environment]::NewLine +
-        '4. 选择机器人，默认下载最近 1 个媒体；普通文字会自动忽略。' + [Environment]::NewLine +
+        '4. 选择聊天并加载媒体清单，可搜索、按类型筛选并勾选下载。' + [Environment]::NewLine +
         '5. 链接队列支持重试、移除和打开原消息。' + [Environment]::NewLine +
         '6. 下载失败会按设置自动重试，完成后可显示系统通知。' +
         [Environment]::NewLine + [Environment]::NewLine +
